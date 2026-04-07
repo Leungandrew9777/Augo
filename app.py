@@ -103,16 +103,16 @@ def predict_upcoming(upcoming, df_elo):
 # MATCHWEEK FIXTURES (edit here if needed)
 # =============================================================
 fixtures_data = [
-    {"date": "2026-04-11", "home_team": "Arsenal", "away_team": "Liverpool"},
-    {"date": "2026-04-11", "home_team": "Manchester City", "away_team": "Aston Villa"},
-    {"date": "2026-04-11", "home_team": "Chelsea", "away_team": "Brighton & Hove Albion"},
-    {"date": "2026-04-11", "home_team": "Tottenham Hotspur", "away_team": "Newcastle"},
-    {"date": "2026-04-11", "home_team": "Manchester United", "away_team": "Everton"},
-    {"date": "2026-04-12", "home_team": "West Ham United", "away_team": "Fulham"},
-    {"date": "2026-04-12", "home_team": "Nottingham Forest", "away_team": "Brentford"},
-    {"date": "2026-04-12", "home_team": "Crystal Palace", "away_team": "Leeds United"},
-    {"date": "2026-04-12", "home_team": "Bournemouth", "away_team": "Southampton"},
-    {"date": "2026-04-12", "home_team": "Wolverhampton Wanderers", "away_team": "Burnley"}
+    {"date": "2026-04-11", "home_team": "West Ham United",              "away_team": "Wolverhampton Wanderers"},
+    {"date": "2026-04-11", "home_team": "Arsenal",     "away_team": "Bournemouth"},
+    {"date": "2026-04-11", "home_team": "Brentford",             "away_team": "Everton"},
+    {"date": "2026-04-11", "home_team": "Burnley",   "away_team": "Brighton & Hove Albion"},
+    {"date": "2026-04-12", "home_team": "Liverpool",   "away_team": "Fulham"},
+    {"date": "2026-04-12", "home_team": "Crystal Palace",     "away_team": "Newcastle"},
+    {"date": "2026-04-12", "home_team": "Nottingham Forest",   "away_team": "Aston Villa"},
+    {"date": "2026-04-12", "home_team": "Sunderland",      "away_team": "Tottenham Hotspur"},
+    {"date": "2026-04-12", "home_team": "Chelsea",         "away_team": "Manchester City"},
+    {"date": "2026-04-14", "home_team": "Manchester United", "away_team": "Leeds United"}
 ]
 
 upcoming = pd.DataFrame(fixtures_data)
