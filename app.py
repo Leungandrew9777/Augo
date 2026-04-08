@@ -12,27 +12,26 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== HIDE DEFAULT STREAMLIT UI ======================
+# ====================== HIDE STREAMLIT BRANDING ======================
 hide_streamlit_style = """
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
     .stApp {background-color: #0E1117;}
-    .css-1d391kg {padding-top: 1rem;}
     </style>
 """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # ====================== HEADER ======================
 st.markdown("""
-    <h1 style='text-align: center; color: #FF4B4B;'>
+    <h1 style='text-align: center; color: #FF4B4B; margin-bottom: 0;'>
         🚀 Premier League Matchweek Predictor
     </h1>
-    <p style='text-align: center; color: #B0B0B0; font-size: 18px;'>
+    <p style='text-align: center; color: #B0B0B0; font-size: 18px; margin-top: 0;'>
         Powered by your XGBoost + ELO model • Updated April 2026
     </p>
-    <hr style='margin: 0 0 2rem 0;'>
+    <hr style='margin: 1rem 0 2rem 0;'>
 """, unsafe_allow_html=True)
 
 
@@ -47,8 +46,10 @@ def load_data():
 
 model, df_elo = load_data()
 
+st.success("✅ Model & ELO loaded successfully")
 
-# ====================== FUNCTIONS (same as before, just cleaned) ======================
+
+# ====================== FUNCTIONS ======================
 def validate_fixtures(upcoming, df_elo):
     valid_teams = set(pd.concat([df_elo['home_team'], df_elo['away_team']]).unique())
     errors = []
@@ -117,19 +118,19 @@ def predict_upcoming(upcoming, df_elo):
     return upcoming
 
 
-# ====================== FIXTURES ======================
+# ====================== MATCHWEEK FIXTURES ======================
 fixtures_data = [
-    {"date": "2026-04-11", "home_team": "West Ham United",              "away_team": "Wolverhampton Wanderers"},
-    {"date": "2026-04-11", "home_team": "Arsenal",     "away_team": "Bournemouth"},
-    {"date": "2026-04-11", "home_team": "Brentford",             "away_team": "Everton"},
-    {"date": "2026-04-11", "home_team": "Burnley",   "away_team": "Brighton & Hove Albion"},
-    {"date": "2026-04-12", "home_team": "Liverpool",   "away_team": "Fulham"},
-    {"date": "2026-04-12", "home_team": "Crystal Palace",     "away_team": "Newcastle"},
-    {"date": "2026-04-12", "home_team": "Nottingham Forest",   "away_team": "Aston Villa"},
-    {"date": "2026-04-12", "home_team": "Sunderland",      "away_team": "Tottenham Hotspur"},
-    {"date": "2026-04-12", "home_team": "Chelsea",         "away_team": "Manchester City"},
+    {"date": "2026-04-11", "home_team": "West Ham United", "away_team": "Wolverhampton Wanderers"},
+    {"date": "2026-04-11", "home_team": "Arsenal", "away_team": "Bournemouth"},
+    {"date": "2026-04-11", "home_team": "Brentford", "away_team": "Everton"},
+    {"date": "2026-04-11", "home_team": "Burnley", "away_team": "Brighton & Hove Albion"},
+    {"date": "2026-04-12", "home_team": "Liverpool", "away_team": "Fulham"},
+    {"date": "2026-04-12", "home_team": "Crystal Palace", "away_team": "Newcastle"},
+    {"date": "2026-04-12", "home_team": "Nottingham Forest", "away_team": "Aston Villa"},
+    {"date": "2026-04-12", "home_team": "Sunderland", "away_team": "Tottenham Hotspur"},
+    {"date": "2026-04-12", "home_team": "Chelsea", "away_team": "Manchester City"},
     {"date": "2026-04-14", "home_team": "Manchester United", "away_team": "Leeds United"}
-]  # ← keep the same 10 fixtures you had before
+]
 
 upcoming = pd.DataFrame(fixtures_data)
 upcoming['date'] = pd.to_datetime(upcoming['date'])
@@ -140,44 +141,45 @@ if validate_fixtures(upcoming, df_elo):
     # ====================== SIDEBAR ======================
     with st.sidebar:
         st.header("⚙️ Controls")
-        st.button("🔄 Refresh Predictions", type="primary")
+        if st.button("🔄 Refresh Predictions", type="primary", use_container_width=True):
+            st.rerun()
         st.caption("Matchweek April 11–14 2026")
 
-    # ====================== MAIN TABLE ======================
+    # ====================== BEAUTIFUL TABLE ======================
     st.subheader(f"Matchweek Predictions – {predictions['date'].dt.date.min()} to {predictions['date'].dt.date.max()}")
 
+    display_df = predictions[['date', 'home_team', 'away_team',
+                              'prob_home', 'prob_draw', 'prob_away',
+                              'fair_odds_home', 'fair_odds_draw', 'fair_odds_away']].copy()
 
-    # Style the table
-    def style_table(df):
-        def color_prob(val):
-            if isinstance(val, str) and '%' in val:
-                p = float(val.strip('%')) / 100
-                if p > 0.60: return 'background-color: #006400; color: white;'
-                if p > 0.45: return 'background-color: #1E90FF; color: white;'
-                return 'background-color: #8B0000; color: white;'
+    display_df['prob_home'] = display_df['prob_home'].apply(lambda x: f"{x:.1%}")
+    display_df['prob_draw'] = display_df['prob_draw'].apply(lambda x: f"{x:.1%}")
+    display_df['prob_away'] = display_df['prob_away'].apply(lambda x: f"{x:.1%}")
+
+
+    # Color coding (green = strong home, blue = draw, red = strong away)
+    def highlight_probs(val):
+        try:
+            p = float(val.strip('%')) / 100
+            if p > 0.60: return 'background-color: #006400; color: white'
+            if p > 0.45: return 'background-color: #1E90FF; color: white'
+            return 'background-color: #8B0000; color: white'
+        except:
             return ''
 
-        styled = df.style.applymap(color_prob, subset=['prob_home', 'prob_draw', 'prob_away'])
-        return styled
 
+    styled = display_df.style.map(highlight_probs, subset=['prob_home', 'prob_draw', 'prob_away'])
 
-    display_cols = ['date', 'home_team', 'away_team',
-                    'prob_home', 'prob_draw', 'prob_away',
-                    'fair_odds_home', 'fair_odds_draw', 'fair_odds_away']
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    styled_df = predictions[display_cols].copy()
-    styled_df['prob_home'] = styled_df['prob_home'].apply(lambda x: f"{x:.1%}")
-    styled_df['prob_draw'] = styled_df['prob_draw'].apply(lambda x: f"{x:.1%}")
-    styled_df['prob_away'] = styled_df['prob_away'].apply(lambda x: f"{x:.1%}")
-
-    st.dataframe(
-        style_table(styled_df),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # Download
+    # Download button
     csv = predictions.to_csv(index=False)
-    st.download_button("📥 Download full predictions as CSV", csv, "matchweek_predictions.csv", "text/csv")
+    st.download_button(
+        label="📥 Download full predictions as CSV",
+        data=csv,
+        file_name="matchweek_predictions.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
 st.caption("✅ Team names strictly validated • Model trained on 4,489 historical matches")
