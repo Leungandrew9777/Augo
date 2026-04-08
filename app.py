@@ -12,13 +12,14 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ====================== HIDE STREAMLIT BRANDING ======================
+# ====================== CLEAN UI (no toolbar, no branding) ======================
 hide_streamlit_style = """
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
     .stApp {background-color: #0E1117;}
+    .stDataFrameToolbar {display: none !important;}   /* ← hides the 4 buttons */
     </style>
 """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
@@ -45,8 +46,6 @@ def load_data():
 
 
 model, df_elo = load_data()
-
-st.success("✅ Model & ELO loaded successfully")
 
 
 # ====================== FUNCTIONS ======================
@@ -118,7 +117,7 @@ def predict_upcoming(upcoming, df_elo):
     return upcoming
 
 
-# ====================== MATCHWEEK FIXTURES ======================
+# ====================== FIXTURES ======================
 fixtures_data = [
     {"date": "2026-04-11", "home_team": "West Ham United", "away_team": "Wolverhampton Wanderers"},
     {"date": "2026-04-11", "home_team": "Arsenal", "away_team": "Bournemouth"},
@@ -138,14 +137,7 @@ upcoming['date'] = pd.to_datetime(upcoming['date'])
 if validate_fixtures(upcoming, df_elo):
     predictions = predict_upcoming(upcoming, df_elo)
 
-    # ====================== SIDEBAR ======================
-    with st.sidebar:
-        st.header("⚙️ Controls")
-        if st.button("🔄 Refresh Predictions", type="primary", use_container_width=True):
-            st.rerun()
-        st.caption("Matchweek April 11–14 2026")
-
-    # ====================== BEAUTIFUL TABLE ======================
+    # ====================== MAIN TABLE ======================
     st.subheader(f"Matchweek Predictions – {predictions['date'].dt.date.min()} to {predictions['date'].dt.date.max()}")
 
     display_df = predictions[['date', 'home_team', 'away_team',
@@ -157,7 +149,7 @@ if validate_fixtures(upcoming, df_elo):
     display_df['prob_away'] = display_df['prob_away'].apply(lambda x: f"{x:.1%}")
 
 
-    # Color coding (green = strong home, blue = draw, red = strong away)
+    # Color coding
     def highlight_probs(val):
         try:
             p = float(val.strip('%')) / 100
@@ -171,15 +163,5 @@ if validate_fixtures(upcoming, df_elo):
     styled = display_df.style.map(highlight_probs, subset=['prob_home', 'prob_draw', 'prob_away'])
 
     st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    # Download button
-    csv = predictions.to_csv(index=False)
-    st.download_button(
-        label="📥 Download full predictions as CSV",
-        data=csv,
-        file_name="matchweek_predictions.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
 
 st.caption("✅ Team names strictly validated • Model trained on 4,489 historical matches")
