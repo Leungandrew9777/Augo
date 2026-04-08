@@ -102,11 +102,10 @@ def predict_upcoming(upcoming, df_elo):
     return upcoming
 
 
-# ====================== BOTTOM NAVIGATION (feels like native app) ======================
+# ====================== BOTTOM NAVIGATION ======================
 tab1, tab2 = st.tabs(["📊 Predictions", "✏️ Edit Fixtures"])
 
 with tab1:
-    # Default fixtures (you can change these anytime)
     fixtures_data = [
         {"date": "2026-04-11", "home_team": "West Ham United", "away_team": "Wolverhampton Wanderers"},
         {"date": "2026-04-11", "home_team": "Arsenal", "away_team": "Bournemouth"},
@@ -149,27 +148,30 @@ with tab1:
 
 with tab2:
     st.subheader("Edit Upcoming Fixtures")
-    st.caption("Add, remove or change any match")
+    st.caption("Add / edit / delete matches (date format: YYYY-MM-DD)")
 
-    # Editable table
     edited_df = st.data_editor(
         pd.DataFrame(fixtures_data),
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         column_config={
-            "date": st.column_config.DateColumn("Date", required=True),
+            "date": st.column_config.TextColumn("Date (YYYY-MM-DD)", required=True),
             "home_team": st.column_config.TextColumn("Home Team", required=True),
             "away_team": st.column_config.TextColumn("Away Team", required=True),
         }
     )
 
     if st.button("🔄 Use these fixtures for Predictions", type="primary", use_container_width=True):
-        upcoming = edited_df.copy()
-        upcoming['date'] = pd.to_datetime(upcoming['date'])
-        if validate_fixtures(upcoming, df_elo):
-            predictions = predict_upcoming(upcoming, df_elo)
-            st.success("✅ Fixtures updated! Switch back to Predictions tab to see results.")
-            # You can even show a preview here if you want
+        try:
+            upcoming = edited_df.copy()
+            upcoming['date'] = pd.to_datetime(upcoming['date'], errors='coerce')
+            if upcoming['date'].isnull().any():
+                st.error("Some dates are invalid. Please use YYYY-MM-DD format.")
+            elif validate_fixtures(upcoming, df_elo):
+                predictions = predict_upcoming(upcoming, df_elo)
+                st.success("✅ Fixtures updated! Switch back to the **Predictions** tab to see the new results.")
+        except Exception as e:
+            st.error(f"Error: {e}")
 
 st.caption("Team names strictly validated • Model trained on 4,489 historical matches")
