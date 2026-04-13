@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 fetch_understat_xg.py — Pull Premier League xG data using understatapi
-Outputs: premier_league_historical_clean.csv (ready to merge with your historical data)
+Merges xG columns INTO premier_league_historical_clean.csv without
+overwriting existing columns (home_goals, away_goals, result, etc.)
 """
 
 import pandas as pd
@@ -15,32 +16,37 @@ LEAGUE = "EPL"
 START_SEASON = 2014   # 2014/15 season
 END_SEASON = 2026     # up to current / future season (Understat updates live)
 
-# Your exact team names from the app (for perfect matching)
 TEAM_NAME_MAP = {
     "Manchester United": "Manchester United",
     "Manchester City": "Manchester City",
     "Liverpool": "Liverpool",
     "Chelsea": "Chelsea",
     "Arsenal": "Arsenal",
-    "Tottenham Hotspur": "Tottenham Hotspur",
+    "Tottenham Hotspur": "Tottenham Hotspur",       
     "Tottenham": "Tottenham Hotspur",
     "West Ham United": "West Ham United",
+    "West Ham": "West Ham United",
     "Newcastle": "Newcastle",
+    "Newcastle United": "Newcastle",
     "Aston Villa": "Aston Villa",
     "Bournemouth": "Bournemouth",
     "Brentford": "Brentford",
     "Brighton & Hove Albion": "Brighton & Hove Albion",
+    "Brighton": "Brighton & Hove Albion",
     "Burnley": "Burnley",
     "Crystal Palace": "Crystal Palace",
     "Everton": "Everton",
     "Fulham": "Fulham",
     "Leeds United": "Leeds United",
+    "Leeds": "Leeds United",
     "Nottingham Forest": "Nottingham Forest",
     "Sunderland": "Sunderland",
     "Wolverhampton Wanderers": "Wolverhampton Wanderers",
-    # Add any missing teams here if needed
+    "Wolves": "Wolverhampton Wanderers",
 }
 # ========================================================
+
+HISTORICAL_FILE = "premier_league_historical_clean.csv"
 
 def normalize_team(name: str) -> str:
     name = str(name).strip()
@@ -52,11 +58,9 @@ all_matches = []
 with UnderstatClient() as understat:
     for season in tqdm(range(START_SEASON, END_SEASON + 1), desc="Seasons"):
         try:
-            # Fetch league match data for the season.
             match_data = understat.league(league=LEAGUE).get_match_data(season=str(season))
             
             for m in match_data:
-                # Keep only completed matches (xG present/meaningful).
                 if not m.get("isResult", False):
                     continue
 
@@ -66,24 +70,15 @@ with UnderstatClient() as understat:
                 a = m.get("a") or {}
 
                 home_team = normalize_team(
-                    m.get("h_team")
-                    or h.get("title")
-                    or h.get("name")
-                    or h.get("team")
-                    or ""
+                    m.get("h_team") or h.get("title") or h.get("name") or h.get("team") or ""
                 )
                 away_team = normalize_team(
-                    m.get("a_team")
-                    or a.get("title")
-                    or a.get("name")
-                    or a.get("team")
-                    or ""
+                    m.get("a_team") or a.get("title") or a.get("name") or a.get("team") or ""
                 )
                 
                 if not home_team or not away_team:
                     continue
 
-                # Prefer xG from match payload (much faster than fetching shots per match).
                 xg = m.get("xG") or {}
                 try:
                     home_xg = float(xg.get("h", h.get("xG", 0.0)) or 0.0)
@@ -92,35 +87,54 @@ with UnderstatClient() as understat:
                     home_xg = away_xg = 0.0
 
                 all_matches.append({
-                    "date": pd.to_datetime(date_str, errors="coerce").date(),
+                    "date":      pd.to_datetime(date_str, errors="coerce").date(),
                     "home_team": home_team,
                     "away_team": away_team,
-                    "home_xg": round(home_xg, 3),
-                    "away_xg": round(away_xg, 3),
+                    "home_xg":   round(home_xg, 3),
+                    "away_xg":   round(away_xg, 3),
                 })
                 
         except Exception as e:
             print(f"⚠️  Season {season} skipped: {e}")
 
-# Save results
+# ── Build xG dataframe ────────────────────────────────────────────────────────
 df_xg = pd.DataFrame(all_matches)
 if df_xg.empty:
-    raise SystemExit(
-        "No matches were returned from Understat. "
-        "This usually means the API call failed or returned an unexpected schema."
-    )
+    raise SystemExit("No matches returned from Understat — API may have failed.")
 
-# Defensive normalization in case upstream keys ever change.
-df_xg.columns = [str(c).strip().lower() for c in df_xg.columns]
-if "date" not in df_xg.columns:
-    raise KeyError(f"'date' column missing. Columns returned: {list(df_xg.columns)}")
-
-# Ensure sortable datetime (keep output as YYYY-MM-DD in CSV).
-df_xg["date"] = pd.to_datetime(df_xg["date"], errors="coerce").dt.date
+df_xg["date"] = pd.to_datetime(df_xg["date"], errors="coerce")
 df_xg = df_xg.dropna(subset=["date", "home_team", "away_team"])
 df_xg = df_xg.drop_duplicates(subset=["date", "home_team", "away_team"])
-df_xg = df_xg.sort_values("date").reset_index(drop=True)
-df_xg.to_csv("premier_league_historical_clean.csv", index=False)
-print(f"\n✅ Success! Saved {len(df_xg):,} matches with xG → premier_league_historical_clean.csv")
-print(f"   Date range: {df_xg['date'].min()} to {df_xg['date'].max()}")
-print("\nNext step: Run the merge script below to add xG to your historical file.")
+
+print(f"\n✅ Fetched {len(df_xg):,} xG records from Understat.")
+
+# ── Merge INTO existing historical file ───────────────────────────────────────
+import os
+if not os.path.exists(HISTORICAL_FILE):
+    raise SystemExit(f"❌ {HISTORICAL_FILE} not found — run your historical data pipeline first.")
+
+existing = pd.read_csv(HISTORICAL_FILE)
+existing["date"] = pd.to_datetime(existing["date"], errors="coerce")
+print(f"   Existing historical rows: {len(existing):,}")
+
+# Drop stale xg columns if they exist from a previous run
+for col in ["home_xg", "away_xg"]:
+    if col in existing.columns:
+        existing = existing.drop(columns=[col])
+
+# Left join: keeps ALL existing rows; unmatched ones get NaN for xg
+merged = existing.merge(
+    df_xg[["date", "home_team", "away_team", "home_xg", "away_xg"]],
+    on=["date", "home_team", "away_team"],
+    how="left",
+)
+
+matched   = merged["home_xg"].notna().sum()
+unmatched = merged["home_xg"].isna().sum()
+print(f"   Matched xG:   {matched:,} rows")
+print(f"   Unmatched:    {unmatched:,} rows (xg will be NaN — check team name mapping)")
+
+merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
+merged.to_csv(HISTORICAL_FILE, index=False)
+print(f"\n✅ Saved → {HISTORICAL_FILE}  (original columns preserved, xg added)")
+print(f"   Date range: {merged['date'].min()} to {merged['date'].max()}")
