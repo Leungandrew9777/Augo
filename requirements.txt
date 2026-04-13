@@ -1,4 +1,5 @@
-streamlit
+reflex
 pandas
 joblib
 xgboost
+reflex==0.8.28.post1
