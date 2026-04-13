@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 fetch_understat_xg.py — Pull Premier League xG data using understatapi
-Outputs: premier_league_xg.csv (ready to merge with your historical data)
+Outputs: premier_league_historical_clean.csv (ready to merge with your historical data)
 """
 
 import pandas as pd
@@ -52,35 +52,52 @@ all_matches = []
 with UnderstatClient() as understat:
     for season in tqdm(range(START_SEASON, END_SEASON + 1), desc="Seasons"):
         try:
-            # Get all matches for the season via one team (covers the entire league)
-            match_data = understat.team(team="Manchester_United").get_match_data(season=str(season))
+            # Fetch league match data for the season.
+            match_data = understat.league(league=LEAGUE).get_match_data(season=str(season))
             
             for m in match_data:
-                match_id = m["id"]
-                date_str = m["date"]  # Understat format: YYYY-MM-DD HH:MM
-                home_team = normalize_team(m.get("h_team", ""))
-                away_team = normalize_team(m.get("a_team", ""))
+                # Keep only completed matches (xG present/meaningful).
+                if not m.get("isResult", False):
+                    continue
+
+                date_str = m.get("datetime") or m.get("date") or ""
+
+                h = m.get("h") or {}
+                a = m.get("a") or {}
+
+                home_team = normalize_team(
+                    m.get("h_team")
+                    or h.get("title")
+                    or h.get("name")
+                    or h.get("team")
+                    or ""
+                )
+                away_team = normalize_team(
+                    m.get("a_team")
+                    or a.get("title")
+                    or a.get("name")
+                    or a.get("team")
+                    or ""
+                )
                 
                 if not home_team or not away_team:
                     continue
 
-                # Get shot data to calculate xG
+                # Prefer xG from match payload (much faster than fetching shots per match).
+                xg = m.get("xG") or {}
                 try:
-                    shots = understat.match(match=match_id).get_shot_data()
-                    home_xg = sum(float(s["xG"]) for s in shots if s["h_a"] == "h")
-                    away_xg = sum(float(s["xG"]) for s in shots if s["h_a"] == "a")
+                    home_xg = float(xg.get("h", h.get("xG", 0.0)) or 0.0)
+                    away_xg = float(xg.get("a", a.get("xG", 0.0)) or 0.0)
                 except Exception:
-                    home_xg = away_xg = 0.0  # fallback
+                    home_xg = away_xg = 0.0
 
                 all_matches.append({
-                    "date": pd.to_datetime(date_str).date(),
+                    "date": pd.to_datetime(date_str, errors="coerce").date(),
                     "home_team": home_team,
                     "away_team": away_team,
                     "home_xg": round(home_xg, 3),
                     "away_xg": round(away_xg, 3),
                 })
-                
-                time.sleep(0.3)  # polite delay to avoid rate-limiting
                 
         except Exception as e:
             print(f"⚠️  Season {season} skipped: {e}")
@@ -103,8 +120,7 @@ df_xg["date"] = pd.to_datetime(df_xg["date"], errors="coerce").dt.date
 df_xg = df_xg.dropna(subset=["date", "home_team", "away_team"])
 df_xg = df_xg.drop_duplicates(subset=["date", "home_team", "away_team"])
 df_xg = df_xg.sort_values("date").reset_index(drop=True)
-
-df_xg.to_csv("premier_league_xg.csv", index=False)
-print(f"\n✅ Success! Saved {len(df_xg):,} matches with xG → premier_league_xg.csv")
+df_xg.to_csv("premier_league_historical_clean.csv", index=False)
+print(f"\n✅ Success! Saved {len(df_xg):,} matches with xG → premier_league_historical_clean.csv")
 print(f"   Date range: {df_xg['date'].min()} to {df_xg['date'].max()}")
 print("\nNext step: Run the merge script below to add xG to your historical file.")
