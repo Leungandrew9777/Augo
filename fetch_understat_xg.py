@@ -43,6 +43,20 @@ TEAM_NAME_MAP = {
     "Sunderland": "Sunderland",
     "Wolverhampton Wanderers": "Wolverhampton Wanderers",
     "Wolves": "Wolverhampton Wanderers",
+
+    "Leicester": "Leicester City",
+    'Queens Park Rangers': 'Queens Park Rangers',
+    "Stoke": "Stoke",
+    "Hull": "Hull",
+    "Southampton": "Southampton",
+    "Middlesbrough": "Middlesbrough",
+    "Swansea": "Swansea",
+    "West Bromwich Albion": "West Bromwich Albion",
+    "Cardiff": "Cardiff",
+    "Watford": "Watford",
+    "Huddersfield": "Huddersfield",
+    "Norwich": "Norwich City",
+    "Ipswich": "Ipswich Town",
 }
 # ========================================================
 

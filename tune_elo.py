@@ -18,11 +18,11 @@ MODEL_OUT       = "xgboost_premier_league_model.pkl"
 FEATURES_OUT    = "premier_league_features_with_target.csv"
 
 # Expanded grid (still runs in ~10-20 min on a laptop)
-HALF_LIFE_GRID   = [1.0, 1.2, 1.5, 1.8, 2.0, 2.5]
-K_GRID           = [20, 28, 32, 40, 48]
-HOME_ADV_GRID    = [75, 90, 100, 110, 125]
-XG_BLEND_GRID    = [0.0, 0.15, 0.25, 0.35, 0.45]   # how much xG share influences the result score
-XG_MARGIN_GRID   = [0.0, 0.1, 0.2, 0.3]           # extra K scaling per xG goal margin
+HALF_LIFE_GRID   = [1.0, 1.5, 2.5, 3.0]
+K_GRID           = [32]
+HOME_ADV_GRID    = [110]
+XG_BLEND_GRID    = [0.15, 1.0]   # how much xG share influences the result score
+XG_MARGIN_GRID   = [0.1, 0.75]           # extra K scaling per xG goal margin
 
 N_ESTIMATORS = 300
 LEARNING_RATE = 0.05
