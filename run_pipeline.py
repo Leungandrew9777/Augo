@@ -45,6 +45,9 @@ FEATURE_COLS = [
     "away_win_rate_5",  "away_win_rate_10",
     "home_draw_rate_5", "away_draw_rate_5",
     "h2h_home_win_rate",
+    "home_xg_5", "away_xg_5",
+    "home_xga_5", "away_xga_5",
+    "xg_diff",
 ]
 
 
@@ -85,6 +88,28 @@ def build_features(upcoming: pd.DataFrame, df_elo: pd.DataFrame) -> pd.DataFrame
             if len(df_elo[df_elo["away_team"] == t]) > 0 else 0.3
         )
     upcoming["h2h_home_win_rate"] = 0.5
+
+    if "home_xg" in df_elo.columns and "away_xg" in df_elo.columns:
+        upcoming["home_xg_5"] = upcoming["home_team"].apply(
+            lambda t: df_elo[df_elo["home_team"] == t].tail(5)["home_xg"].mean()
+            if len(df_elo[df_elo["home_team"] == t]) > 0 else 1.30)
+        upcoming["away_xg_5"] = upcoming["away_team"].apply(
+            lambda t: df_elo[df_elo["away_team"] == t].tail(5)["away_xg"].mean()
+            if len(df_elo[df_elo["away_team"] == t]) > 0 else 1.10)
+        upcoming["home_xga_5"] = upcoming["home_team"].apply(
+            lambda t: df_elo[df_elo["home_team"] == t].tail(5)["away_xg"].mean()
+            if len(df_elo[df_elo["home_team"] == t]) > 0 else 1.10)
+        upcoming["away_xga_5"] = upcoming["away_team"].apply(
+            lambda t: df_elo[df_elo["away_team"] == t].tail(5)["home_xg"].mean()
+            if len(df_elo[df_elo["away_team"] == t]) > 0 else 1.30)
+        upcoming["xg_diff"] = upcoming["home_xg_5"] - upcoming["away_xg_5"]
+    else:
+        upcoming["home_xg_5"] = 1.30
+        upcoming["away_xg_5"] = 1.10
+        upcoming["home_xga_5"] = 1.10
+        upcoming["away_xga_5"] = 1.30
+        upcoming["xg_diff"] = 0.20
+
     return upcoming
 
 
@@ -150,14 +175,51 @@ def main():
     if args.gw is not None:
         if gw_col is None:
             sys.exit("❌  --gw specified but no matchweek/gameweek column found.")
-        selected = future[future[gw_col] == args.gw].sort_values("date")
+        selected = df_fix[df_fix[gw_col] == args.gw].sort_values("date")
         if selected.empty:
             sys.exit(f"❌  No fixtures found for matchweek {args.gw}.")
         gw_label = f"GW{args.gw}"
     elif gw_col and future[gw_col].notna().any():
         next_gw  = future.iloc[0][gw_col]
-        selected = future[future[gw_col] == next_gw].sort_values("date")
-        gw_label = f"GW{int(next_gw)}"
+
+        # Optional prompt: allow choosing a later upcoming gameweek.
+        # (Keeps --gw for scripted/non-interactive usage.)
+        chosen_gw = next_gw
+        if sys.stdin.isatty():
+            try:
+                available = (
+                    future[gw_col]
+                    .dropna()
+                    .astype(int)
+                    .sort_values()
+                    .unique()
+                    .tolist()
+                )
+                available_after = [g for g in available if g >= int(next_gw)]
+            except Exception:
+                available_after = []
+
+            if available_after:
+                print(f"Auto-detected current gameweek: GW{int(next_gw)}")
+                print("Upcoming gameweeks:", ", ".join(f"GW{g}" for g in available_after[:12]) +
+                      (" …" if len(available_after) > 12 else ""))
+                raw = input("Enter a later GW number to run (or press Enter to keep current): ").strip()
+                if raw:
+                    try:
+                        gw_int = int(raw)
+                        if gw_int < int(next_gw):
+                            print(f"⚠️  GW{gw_int} is before current GW{int(next_gw)}; using current.")
+                        elif gw_int not in available_after:
+                            print(f"⚠️  GW{gw_int} not found in upcoming fixtures; using current.")
+                        else:
+                            chosen_gw = gw_int
+                    except ValueError:
+                        print("⚠️  Invalid input; using current.")
+
+        # Important: select from ALL fixtures so we show the full gameweek,
+        # not just matches on/after today.
+        selected = df_fix[df_fix[gw_col] == chosen_gw].sort_values("date")
+        gw_label = f"GW{int(chosen_gw)}"
     else:
         start    = future["date"].min()
         selected = future[future["date"] <= start + pd.Timedelta(days=3)]

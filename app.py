@@ -3,11 +3,33 @@ import pandas as pd
 import joblib
 import json
 import os
+import math
 from typing import Any
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+
+ODDS_DISPLAY_CAP = 200.0
+
+
+def format_odds_display(v: float, cap: float = ODDS_DISPLAY_CAP) -> str:
+    """Format odds for UI display without scientific notation."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return f"{cap:.0f}"
+
+    if not math.isfinite(x):
+        return f"{cap:.0f}"
+
+    if x >= cap:
+        return f"{cap:.0f}"
+    if x >= 10:
+        return f"{x:.1f}".rstrip("0").rstrip(".")
+    if x >= 1:
+        return f"{x:.2f}".rstrip("0").rstrip(".")
+    return f"{x:.3f}".rstrip("0").rstrip(".")
 
 PL_TEAMS: list[str] = sorted([
     "Arsenal", "Aston Villa", "Bournemouth", "Brentford",
@@ -43,16 +65,16 @@ TEAM_BADGES: dict[str, str] = {
 FALLBACK_BADGE = "https://resources.premierleague.com/premierleague/badges/t0.png"
 
 FALLBACK_FIXTURES: list[dict] = [
-    {"idx": 0, "date": "2026-04-11", "home_team": "West Ham United",     "away_team": "Wolverhampton Wanderers"},
+    {"idx": 0, "date": "2026-04-11", "home_team": "Arsenal",             "away_team": "Bournemouth"},
     {"idx": 1, "date": "2026-04-11", "home_team": "Arsenal",             "away_team": "Bournemouth"},
-    {"idx": 2, "date": "2026-04-11", "home_team": "Brentford",           "away_team": "Everton"},
-    {"idx": 3, "date": "2026-04-11", "home_team": "Burnley",             "away_team": "Brighton & Hove Albion"},
-    {"idx": 4, "date": "2026-04-12", "home_team": "Liverpool",           "away_team": "Fulham"},
-    {"idx": 5, "date": "2026-04-12", "home_team": "Crystal Palace",      "away_team": "Newcastle"},
-    {"idx": 6, "date": "2026-04-12", "home_team": "Nottingham Forest",   "away_team": "Aston Villa"},
-    {"idx": 7, "date": "2026-04-12", "home_team": "Sunderland",          "away_team": "Tottenham Hotspur"},
-    {"idx": 8, "date": "2026-04-12", "home_team": "Chelsea",             "away_team": "Manchester City"},
-    {"idx": 9, "date": "2026-04-14", "home_team": "Manchester United",   "away_team": "Leeds United"},
+    {"idx": 2, "date": "2026-04-11", "home_team": "Arsenal",             "away_team": "Bournemouth"},
+    {"idx": 3, "date": "2026-04-11", "home_team": "Arsenal",             "away_team": "Bournemouth"},
+    {"idx": 4, "date": "2026-04-12", "home_team": "Arsenal",             "away_team": "Bournemouth"},
+    {"idx": 5, "date": "2026-04-12", "home_team": "Arsenal",             "away_team": "Bournemouth"},
+    {"idx": 6, "date": "2026-04-12", "home_team": "Arsenal",             "away_team": "Bournemouth"},
+    {"idx": 7, "date": "2026-04-12", "home_team": "Arsenal",             "away_team": "Bournemouth"},
+    {"idx": 8, "date": "2026-04-12", "home_team": "Arsenal",             "away_team": "Bournemouth"},
+    {"idx": 9, "date": "2026-04-14", "home_team": "Arsenal",             "away_team": "Bournemouth"},
 ]
 
 from typing import TypedDict
@@ -317,9 +339,37 @@ class State(rx.State):
                 if len(df_elo[df_elo["away_team"] == t]) > 0 else 0.3)
         upcoming["h2h_home_win_rate"] = 0.5
 
-        feature_cols = ["elo_diff", "home_win_rate_5", "home_win_rate_10",
-                        "away_win_rate_5", "away_win_rate_10",
-                        "home_draw_rate_5", "away_draw_rate_5", "h2h_home_win_rate"]
+        if "home_xg" in df_elo.columns and "away_xg" in df_elo.columns:
+            upcoming["home_xg_5"] = upcoming["home_team"].apply(
+                lambda t: df_elo[df_elo["home_team"] == t].tail(5)["home_xg"].mean()
+                if len(df_elo[df_elo["home_team"] == t]) > 0 else 1.30)
+            upcoming["away_xg_5"] = upcoming["away_team"].apply(
+                lambda t: df_elo[df_elo["away_team"] == t].tail(5)["away_xg"].mean()
+                if len(df_elo[df_elo["away_team"] == t]) > 0 else 1.10)
+            upcoming["home_xga_5"] = upcoming["home_team"].apply(
+                lambda t: df_elo[df_elo["home_team"] == t].tail(5)["away_xg"].mean()
+                if len(df_elo[df_elo["home_team"] == t]) > 0 else 1.10)
+            upcoming["away_xga_5"] = upcoming["away_team"].apply(
+                lambda t: df_elo[df_elo["away_team"] == t].tail(5)["home_xg"].mean()
+                if len(df_elo[df_elo["away_team"] == t]) > 0 else 1.30)
+            upcoming["xg_diff"] = upcoming["home_xg_5"] - upcoming["away_xg_5"]
+        else:
+            upcoming["home_xg_5"] = 1.30
+            upcoming["away_xg_5"] = 1.10
+            upcoming["home_xga_5"] = 1.10
+            upcoming["away_xga_5"] = 1.30
+            upcoming["xg_diff"] = 0.20
+
+        feature_cols = [
+            "elo_diff",
+            "home_win_rate_5", "home_win_rate_10",
+            "away_win_rate_5", "away_win_rate_10",
+            "home_draw_rate_5", "away_draw_rate_5",
+            "h2h_home_win_rate",
+            "home_xg_5", "away_xg_5",
+            "home_xga_5", "away_xga_5",
+            "xg_diff",
+        ]
         probs = model.predict_proba(upcoming[feature_cols])
 
         upcoming["prob_home"]      = probs[:, 0]
@@ -329,9 +379,9 @@ class State(rx.State):
         upcoming["fair_odds_draw"] = 1 / upcoming["prob_draw"]
         upcoming["fair_odds_away"] = 1 / upcoming["prob_away"]
 
-        upcoming["disp_odds_home"] = upcoming["fair_odds_home"].map(lambda v: f"{v:.3g}")
-        upcoming["disp_odds_draw"] = upcoming["fair_odds_draw"].map(lambda v: f"{v:.3g}")
-        upcoming["disp_odds_away"] = upcoming["fair_odds_away"].map(lambda v: f"{v:.3g}")
+        upcoming["disp_odds_home"] = upcoming["fair_odds_home"].map(format_odds_display)
+        upcoming["disp_odds_draw"] = upcoming["fair_odds_draw"].map(format_odds_display)
+        upcoming["disp_odds_away"] = upcoming["fair_odds_away"].map(format_odds_display)
         upcoming["disp_prob_home"] = upcoming["prob_home"].map(lambda v: f"{v*100:.1f}%")
         upcoming["disp_prob_draw"] = upcoming["prob_draw"].map(lambda v: f"{v*100:.1f}%")
         upcoming["disp_prob_away"] = upcoming["prob_away"].map(lambda v: f"{v*100:.1f}%")
