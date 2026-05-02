@@ -1,16 +1,45 @@
 import reflex as rx
 import pandas as pd
+import numpy as np
 import joblib
 import json
 import os
+import re
 import math
+import datetime as dt
 from typing import Any
+
+import requests
+
+from persistence import (
+    load_archived_predictions,
+    load_bankroll,
+    load_results,
+    load_user_picks,
+    save_bankroll,
+    upsert_user_picks_for_gw,
+)
+from bankroll import build_bankroll, build_current_suggestions, format_money
+from explanations import build_explanation
+from team_aliases import badge_lookup_key
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 ODDS_DISPLAY_CAP = 200.0
+CACHE_FILE = os.path.join(APP_DIR, "predictions_cache.json")
+CACHE_MAX_AGE_HOURS = 36
+
+
+def _local_today_hk() -> pd.Timestamp:
+    """Return today's date normalized in Hong Kong (UTC+8) time."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return pd.Timestamp(dt.datetime.now(ZoneInfo("Asia/Hong_Kong")).date())
+    except Exception:
+        return pd.Timestamp.today().normalize()
 
 
 def format_odds_display(v: float, cap: float = ODDS_DISPLAY_CAP) -> str:
@@ -134,6 +163,18 @@ class PredictionDict(TypedDict):
     fair_odds_home: float
     fair_odds_draw: float
     fair_odds_away: float
+    book_odds_home: float | None
+    book_odds_draw: float | None
+    book_odds_away: float | None
+    book_prob_home: float | None
+    book_prob_draw: float | None
+    book_prob_away: float | None
+    disp_book_odds_home: str
+    disp_book_odds_draw: str
+    disp_book_odds_away: str
+    disp_book_prob_home: str
+    disp_book_prob_draw: str
+    disp_book_prob_away: str
     disp_elo_diff: str
     chart_label: str
     model_pick: str
@@ -158,6 +199,8 @@ class State(rx.State):
     fixtures: list[dict[str, Any]] = FALLBACK_FIXTURES
     predictions: list[dict[str, Any]] = []
     gameweek_label: str = "GW32"
+    prediction_source: str = ""      # "cache" | "live"
+    prediction_source_note: str = "" # reason or timestamp
 
     # User picks for current GW (parallel to predictions list)
     user_picks: list[str] = []   # "" / "H" / "D" / "A"
@@ -174,10 +217,34 @@ class State(rx.State):
     underdog: dict[str, Any] = {}
     win_prob_chart: list[dict[str, Any]] = []
     elo_chart: list[dict[str, Any]] = []
+    bookmaker_rows: list[dict[str, Any]] = []
+    prob_divergence_rows: list[dict[str, Any]] = []
+    value_edge_rows: list[dict[str, Any]] = []
 
     # History
     history: list[dict[str, Any]] = []
     history_selected: int = -1
+
+    # Virtual bankroll
+    bankroll_summary: dict[str, Any] = {
+        "starting_bankroll": 1000.0,
+        "starting_bankroll_disp": "$1000.00",
+        "current_bankroll": 1000.0,
+        "current_bankroll_disp": "$1000.00",
+        "risk_cap": 0.05,
+        "risk_cap_disp": "5.0%",
+        "total_pnl": 0.0,
+        "total_pnl_disp": "+$0.00",
+        "pnl_positive": True,
+        "roi_disp": "+0.0%",
+        "record": "0-0",
+        "settled_count": 0,
+        "pending_count": 0,
+    }
+    bankroll_ledger: list[dict[str, Any]] = []
+    bankroll_suggestions: list[dict[str, Any]] = []
+    bankroll_starting_input: str = "1000"
+    bankroll_risk_cap_input: str = "5"
 
     # ── Computed vars ─────────────────────────────────────────────────────────
 
@@ -225,6 +292,23 @@ class State(rx.State):
         matches = self.history[self.history_selected]["matches"]
         return [dict(m, match_idx=i) for i, m in enumerate(matches)]
 
+    @rx.var
+    def prediction_source_label(self) -> str:
+        if self.prediction_source == "cache":
+            note = f" ({self.prediction_source_note})" if self.prediction_source_note else ""
+            return f"Cached predictions{note}"
+        if self.prediction_source == "live":
+            return "Live inference (model run in app)"
+        return "Model predictions"
+
+    @rx.var
+    def prediction_source_color(self) -> str:
+        if self.prediction_source == "cache":
+            return "#4CAF50"
+        if self.prediction_source == "live":
+            return "#FFB74D"
+        return "#444"
+
     # ── Fixtures ──────────────────────────────────────────────────────────────
 
     def _reindex(self):
@@ -239,10 +323,9 @@ class State(rx.State):
             try:
                 df = pd.read_csv(path)
                 df = df.copy()
-                # Expect ISO dates: YYYY-MM-DD
-                df["date"] = pd.to_datetime(df["date"], format="%Y-%m-%d", errors="coerce").dt.normalize()
+                df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce").dt.normalize()
                 df = df.dropna(subset=["date", "home_team", "away_team"])
-                today = pd.Timestamp.today().normalize()
+                today = _local_today_hk()
 
                 # Accept either "gameweek" or "matchweek" as the GW column name
                 gw_col = next((c for c in ["gameweek", "matchweek"] if c in df.columns and df[c].notna().any()), None)
@@ -271,13 +354,19 @@ class State(rx.State):
                     selected = df[(df["date"] >= start) & (df["date"] <= end)]
                     self.gameweek_label = f"Next ({start.strftime('%b %d')})"
                 rows: list[dict[str, Any]] = []
+                has_b365_cols = all(c in selected.columns for c in ["B365H", "B365D", "B365A"])
                 for i, row in enumerate(selected.itertuples(index=False), start=0):
-                    rows.append({
+                    fixture_row = {
                         "idx": i,
                         "date": str(getattr(row, "date").date()),
                         "home_team": str(getattr(row, "home_team")),
                         "away_team": str(getattr(row, "away_team")),
-                    })
+                    }
+                    if has_b365_cols:
+                        fixture_row["B365H"] = getattr(row, "B365H")
+                        fixture_row["B365D"] = getattr(row, "B365D")
+                        fixture_row["B365A"] = getattr(row, "B365A")
+                    rows.append(fixture_row)
                 if rows:
                     self.fixtures = rows
             except Exception:
@@ -304,12 +393,49 @@ class State(rx.State):
     # ── ML pipeline ──────────────────────────────────────────────────────────
 
     def _load_model_and_elo(self):
+        from team_aliases import elo_lookup_key
         model = joblib.load("xgboost_premier_league_model.pkl")
+        # Patch LR estimator for sklearn cross-version compatibility
+        from sklearn.linear_model import LogisticRegression
+        for est in getattr(model, "estimators_", []):
+            if hasattr(est, "named_steps") and "model" in est.named_steps:
+                inner = est.named_steps["model"]
+                if isinstance(inner, LogisticRegression) and not hasattr(inner, "multi_class"):
+                    setattr(inner, "multi_class", "auto")
         df_elo = pd.read_csv("premier_league_with_elo_best.csv")
+        # Normalise column names: Football-Data CSVs use CamelCase
+        rename_map = {}
+        if "Date" in df_elo.columns and "date" not in df_elo.columns:
+            rename_map["Date"] = "date"
+        if "HomeTeam" in df_elo.columns and "home_team" not in df_elo.columns:
+            rename_map["HomeTeam"] = "home_team"
+        if "AwayTeam" in df_elo.columns and "away_team" not in df_elo.columns:
+            rename_map["AwayTeam"] = "away_team"
+        if "FTR" in df_elo.columns and "result" not in df_elo.columns:
+            rename_map["FTR"] = "result"
+        if rename_map:
+            df_elo = df_elo.rename(columns=rename_map)
+        if "result" in df_elo.columns:
+            vals = set(df_elo["result"].dropna().astype(str).unique())
+            if vals.issubset({"0", "1", "2"}):
+                df_elo["result"] = df_elo["result"].map(
+                    {2: "H", 1: "D", 0: "A", "2": "H", "1": "D", "0": "A"}
+                )
         df_elo["date"] = pd.to_datetime(df_elo["date"])
-        return model, df_elo
+        # Apply team name aliases so fixture names match ELO history
+        df_elo["home_team"] = df_elo["home_team"].map(
+            lambda t: t  # ELO file already uses short names; no reverse alias needed
+        )
+        return model, df_elo, elo_lookup_key
 
-    def _compute_current_elo(self, upcoming: pd.DataFrame, df_elo: pd.DataFrame) -> pd.DataFrame:
+    def _compute_current_elo(
+        self,
+        upcoming: pd.DataFrame,
+        df_elo: pd.DataFrame,
+        elo_key=None,
+    ) -> pd.DataFrame:
+        from team_aliases import elo_lookup_key as _elo_key
+        _key = elo_key if elo_key is not None else _elo_key
         latest_elo: dict = {}
         for team in pd.concat([df_elo["home_team"], df_elo["away_team"]]).unique():
             m = df_elo[(df_elo["home_team"] == team) | (df_elo["away_team"] == team)]
@@ -318,63 +444,196 @@ class State(rx.State):
                 latest_elo[team] = last["elo_home_before"] if last["home_team"] == team else last["elo_away_before"]
             else:
                 latest_elo[team] = 1500.0
-        upcoming["elo_home"] = upcoming["home_team"].map(latest_elo).fillna(1500.0)
-        upcoming["elo_away"] = upcoming["away_team"].map(latest_elo).fillna(1500.0)
+        upcoming["elo_home"] = upcoming["home_team"].map(lambda t: latest_elo.get(_key(t), 1500.0))
+        upcoming["elo_away"] = upcoming["away_team"].map(lambda t: latest_elo.get(_key(t), 1500.0))
         upcoming["elo_diff"] = upcoming["elo_home"] - upcoming["elo_away"]
         return upcoming
 
+    def _h2h_home_win_rate_for_fixture(
+        self,
+        home: str,
+        away: str,
+        fixture_date: pd.Timestamp,
+        df_elo: pd.DataFrame,
+        max_meetings: int = 8,
+        decay_half_life_years: float = 2.0,
+    ) -> float:
+        """Time-decayed H2H home win rate from prior meetings."""
+        meetings = df_elo[
+            (
+                ((df_elo["home_team"] == home) & (df_elo["away_team"] == away))
+                | ((df_elo["home_team"] == away) & (df_elo["away_team"] == home))
+            )
+            & (df_elo["date"] < fixture_date)
+        ].sort_values("date")
+
+        if meetings.empty:
+            return 0.5
+
+        meetings = meetings.tail(max_meetings)
+        weights: list[float] = []
+        scores: list[float] = []
+        for row in meetings.itertuples():
+            age_years = max((fixture_date - row.date).days / 365.25, 0.0)
+            w = float(np.exp(-age_years * np.log(2) / decay_half_life_years))
+            weights.append(w)
+            if row.home_team == home:
+                scores.append(1.0 if row.result == "H" else (0.5 if row.result == "D" else 0.0))
+            else:
+                scores.append(1.0 if row.result == "A" else (0.5 if row.result == "D" else 0.0))
+
+        total_w = sum(weights)
+        if total_w <= 0:
+            return 0.5
+        return float(sum(s * w for s, w in zip(scores, weights)) / total_w)
+
+    @staticmethod
+    def _latest_team_feature(
+        df_elo: pd.DataFrame, team_col: str, team_name: str, feature_col: str,
+    ) -> float | None:
+        if feature_col not in df_elo.columns:
+            return None
+        series = pd.to_numeric(
+            df_elo.loc[df_elo[team_col] == team_name, feature_col], errors="coerce",
+        ).dropna()
+        if series.empty:
+            return None
+        return float(series.iloc[-1])
+
+    @staticmethod
+    def _ensure_model_features(
+        upcoming: pd.DataFrame, df_elo: pd.DataFrame, expected_cols: list[str],
+    ) -> pd.DataFrame:
+        if not expected_cols:
+            return upcoming
+        from team_aliases import elo_lookup_key as _key
+
+        medians: dict[str, float] = {}
+        for col in expected_cols:
+            if col in df_elo.columns:
+                s = pd.to_numeric(df_elo[col], errors="coerce").dropna()
+                if not s.empty:
+                    medians[col] = float(s.median())
+
+        def _fill_home(col: str):
+            fallback = medians.get(col, 0.0)
+            upcoming[col] = upcoming["home_team"].map(
+                lambda t: State._latest_team_feature(df_elo, "home_team", _key(str(t)), col)
+            )
+            upcoming[col] = pd.to_numeric(upcoming[col], errors="coerce").fillna(fallback)
+
+        def _fill_away(col: str):
+            fallback = medians.get(col, 0.0)
+            upcoming[col] = upcoming["away_team"].map(
+                lambda t: State._latest_team_feature(df_elo, "away_team", _key(str(t)), col)
+            )
+            upcoming[col] = pd.to_numeric(upcoming[col], errors="coerce").fillna(fallback)
+
+        if "date" in upcoming.columns and any(c in expected_cols for c in (
+            "h2h_home_wins", "h2h_draws", "h2h_total_goals_avg",
+        )):
+            def _prior_matches(team: str, fixture_date) -> pd.DataFrame:
+                date = pd.to_datetime(fixture_date, errors="coerce")
+                if pd.isna(date):
+                    return df_elo.iloc[0:0]
+                return df_elo[
+                    ((df_elo["home_team"] == team) | (df_elo["away_team"] == team))
+                    & (df_elo["date"] < date)
+                ].sort_values("date")
+
+            def _rest_days(team: str, fixture_date):
+                prior = _prior_matches(team, fixture_date)
+                if prior.empty:
+                    return pd.NA
+                return int((pd.to_datetime(fixture_date) - prior.iloc[-1]["date"]).days)
+
+            def _h2h_features(row) -> pd.Series:
+                home = _key(str(row["home_team"]))
+                away = _key(str(row["away_team"]))
+                date = pd.to_datetime(row["date"], errors="coerce")
+                if pd.isna(date):
+                    return pd.Series({"h2h_home_wins": pd.NA, "h2h_draws": pd.NA, "h2h_total_goals_avg": pd.NA})
+                prior = df_elo[
+                    (df_elo["date"] < date)
+                    & (
+                        ((df_elo["home_team"] == home) & (df_elo["away_team"] == away))
+                        | ((df_elo["home_team"] == away) & (df_elo["away_team"] == home))
+                    )
+                ].tail(5)
+                if prior.empty:
+                    return pd.Series({"h2h_home_wins": pd.NA, "h2h_draws": pd.NA, "h2h_total_goals_avg": pd.NA})
+                wins = 0
+                draws = 0
+                total_goals = 0
+                for _, p in prior.iterrows():
+                    gh = int(p["FTHG"])
+                    ga = int(p["FTAG"])
+                    total_goals += gh + ga
+                    if p["home_team"] == home:
+                        wins += gh > ga
+                    else:
+                        wins += ga > gh
+                    draws += gh == ga
+                return pd.Series({
+                    "h2h_home_wins": wins / len(prior),
+                    "h2h_draws": draws / len(prior),
+                    "h2h_total_goals_avg": total_goals / len(prior),
+                })
+
+            h2h = upcoming.apply(_h2h_features, axis=1)
+            for col in h2h.columns:
+                upcoming[col] = h2h[col]
+
+        for col in expected_cols:
+            if col in upcoming.columns:
+                upcoming[col] = pd.to_numeric(upcoming[col], errors="coerce").fillna(medians.get(col, 0.0))
+                continue
+            if col.startswith("home_"):
+                _fill_home(col)
+            elif col.startswith("away_"):
+                _fill_away(col)
+            elif col.startswith("diff_"):
+                suffix = col[len("diff_"):]
+                home_col = f"home_{suffix}"
+                away_col = f"away_{suffix}"
+                if home_col not in upcoming.columns:
+                    _fill_home(home_col)
+                if away_col not in upcoming.columns:
+                    _fill_away(away_col)
+                upcoming[col] = (
+                    pd.to_numeric(upcoming[home_col], errors="coerce").fillna(medians.get(home_col, 0.0))
+                    - pd.to_numeric(upcoming[away_col], errors="coerce").fillna(medians.get(away_col, 0.0))
+                )
+            else:
+                upcoming[col] = medians.get(col, 0.0)
+        return upcoming
+
+    @staticmethod
+    def _detect_model_features(model) -> list[str]:
+        """Extract expected feature names from a fitted model/ensemble."""
+        if hasattr(model, "feature_names_in_"):
+            return [str(c) for c in list(getattr(model, "feature_names_in_", []))]
+        if hasattr(model, "estimators_") and len(getattr(model, "estimators_", [])) > 0:
+            first_est = model.estimators_[0]
+            if hasattr(first_est, "feature_names_in_"):
+                return [str(c) for c in list(getattr(first_est, "feature_names_in_", []))]
+            if hasattr(first_est, "named_steps") and "scaler" in first_est.named_steps:
+                scaler = first_est.named_steps["scaler"]
+                if hasattr(scaler, "feature_names_in_"):
+                    return [str(c) for c in list(getattr(scaler, "feature_names_in_", []))]
+        return []
+
     def _predict_upcoming(self, upcoming: pd.DataFrame, df_elo: pd.DataFrame, model) -> pd.DataFrame:
-        for window in [5, 10]:
-            upcoming[f"home_win_rate_{window}"] = upcoming["home_team"].apply(
-                lambda t: df_elo[df_elo["home_team"] == t].tail(window)["result"].eq("H").mean()
-                if len(df_elo[df_elo["home_team"] == t]) > 0 else 0.5)
-            upcoming[f"home_draw_rate_{window}"] = upcoming["home_team"].apply(
-                lambda t: df_elo[df_elo["home_team"] == t].tail(window)["result"].eq("D").mean()
-                if len(df_elo[df_elo["home_team"] == t]) > 0 else 0.3)
-            upcoming[f"away_win_rate_{window}"] = upcoming["away_team"].apply(
-                lambda t: df_elo[df_elo["away_team"] == t].tail(window)["result"].eq("A").mean()
-                if len(df_elo[df_elo["away_team"] == t]) > 0 else 0.5)
-            upcoming[f"away_draw_rate_{window}"] = upcoming["away_team"].apply(
-                lambda t: df_elo[df_elo["away_team"] == t].tail(window)["result"].eq("D").mean()
-                if len(df_elo[df_elo["away_team"] == t]) > 0 else 0.3)
-        upcoming["h2h_home_win_rate"] = 0.5
-
-        if "home_xg" in df_elo.columns and "away_xg" in df_elo.columns:
-            upcoming["home_xg_5"] = upcoming["home_team"].apply(
-                lambda t: df_elo[df_elo["home_team"] == t].tail(5)["home_xg"].mean()
-                if len(df_elo[df_elo["home_team"] == t]) > 0 else 1.30)
-            upcoming["away_xg_5"] = upcoming["away_team"].apply(
-                lambda t: df_elo[df_elo["away_team"] == t].tail(5)["away_xg"].mean()
-                if len(df_elo[df_elo["away_team"] == t]) > 0 else 1.10)
-            upcoming["home_xga_5"] = upcoming["home_team"].apply(
-                lambda t: df_elo[df_elo["home_team"] == t].tail(5)["away_xg"].mean()
-                if len(df_elo[df_elo["home_team"] == t]) > 0 else 1.10)
-            upcoming["away_xga_5"] = upcoming["away_team"].apply(
-                lambda t: df_elo[df_elo["away_team"] == t].tail(5)["home_xg"].mean()
-                if len(df_elo[df_elo["away_team"] == t]) > 0 else 1.30)
-            upcoming["xg_diff"] = upcoming["home_xg_5"] - upcoming["away_xg_5"]
-        else:
-            upcoming["home_xg_5"] = 1.30
-            upcoming["away_xg_5"] = 1.10
-            upcoming["home_xga_5"] = 1.10
-            upcoming["away_xga_5"] = 1.30
-            upcoming["xg_diff"] = 0.20
-
-        feature_cols = [
-            "elo_diff",
-            "home_win_rate_5", "home_win_rate_10",
-            "away_win_rate_5", "away_win_rate_10",
-            "home_draw_rate_5", "away_draw_rate_5",
-            "h2h_home_win_rate",
-            "home_xg_5", "away_xg_5",
-            "home_xga_5", "away_xga_5",
-            "xg_diff",
-        ]
+        feature_cols = self._detect_model_features(model)
+        if not feature_cols:
+            raise ValueError("Cannot determine expected features from loaded model.")
+        upcoming = self._ensure_model_features(upcoming, df_elo, feature_cols)
         probs = model.predict_proba(upcoming[feature_cols])
 
-        upcoming["prob_home"]      = probs[:, 0]
+        # Model classes are encoded as 0=Away, 1=Draw, 2=Home.
+        upcoming["prob_away"]      = probs[:, 0]
         upcoming["prob_draw"]      = probs[:, 1]
-        upcoming["prob_away"]      = probs[:, 2]
+        upcoming["prob_home"]      = probs[:, 2]
         upcoming["fair_odds_home"] = 1 / upcoming["prob_home"]
         upcoming["fair_odds_draw"] = 1 / upcoming["prob_draw"]
         upcoming["fair_odds_away"] = 1 / upcoming["prob_away"]
@@ -386,8 +645,12 @@ class State(rx.State):
         upcoming["disp_prob_draw"] = upcoming["prob_draw"].map(lambda v: f"{v*100:.1f}%")
         upcoming["disp_prob_away"] = upcoming["prob_away"].map(lambda v: f"{v*100:.1f}%")
         upcoming["disp_elo_diff"]  = upcoming["elo_diff"].map(lambda v: f"{v:+.0f}")
-        upcoming["badge_home"]     = upcoming["home_team"].map(lambda t: TEAM_BADGES.get(t, FALLBACK_BADGE))
-        upcoming["badge_away"]     = upcoming["away_team"].map(lambda t: TEAM_BADGES.get(t, FALLBACK_BADGE))
+        upcoming["badge_home"]     = upcoming["home_team"].map(
+            lambda t: TEAM_BADGES.get(badge_lookup_key(str(t)), FALLBACK_BADGE)
+        )
+        upcoming["badge_away"]     = upcoming["away_team"].map(
+            lambda t: TEAM_BADGES.get(badge_lookup_key(str(t)), FALLBACK_BADGE)
+        )
         upcoming["chart_label"]    = upcoming.apply(
             lambda r: r["home_team"][:3].upper() + " v " + r["away_team"][:3].upper(), axis=1)
 
@@ -398,10 +661,59 @@ class State(rx.State):
                 key=lambda x: x[1]
             )[0], axis=1
         )
+
+        has_book_cols = all(c in upcoming.columns for c in ("B365H", "B365D", "B365A"))
+        if has_book_cols:
+            book_h = pd.to_numeric(upcoming["B365H"], errors="coerce")
+            book_d = pd.to_numeric(upcoming["B365D"], errors="coerce")
+            book_a = pd.to_numeric(upcoming["B365A"], errors="coerce")
+            valid = (book_h > 0) & (book_d > 0) & (book_a > 0)
+
+            upcoming["book_odds_home"] = book_h.where(valid, np.nan)
+            upcoming["book_odds_draw"] = book_d.where(valid, np.nan)
+            upcoming["book_odds_away"] = book_a.where(valid, np.nan)
+
+            inv_h = (1.0 / book_h).where(valid, np.nan)
+            inv_d = (1.0 / book_d).where(valid, np.nan)
+            inv_a = (1.0 / book_a).where(valid, np.nan)
+            total = (inv_h + inv_d + inv_a).where(valid, np.nan)
+
+            upcoming["book_prob_home"] = (inv_h / total).where(valid, np.nan)
+            upcoming["book_prob_draw"] = (inv_d / total).where(valid, np.nan)
+            upcoming["book_prob_away"] = (inv_a / total).where(valid, np.nan)
+        else:
+            upcoming["book_odds_home"] = np.nan
+            upcoming["book_odds_draw"] = np.nan
+            upcoming["book_odds_away"] = np.nan
+            upcoming["book_prob_home"] = np.nan
+            upcoming["book_prob_draw"] = np.nan
+            upcoming["book_prob_away"] = np.nan
+
+        upcoming["disp_book_odds_home"] = upcoming["book_odds_home"].map(
+            lambda v: format_odds_display(v) if pd.notna(v) else ""
+        )
+        upcoming["disp_book_odds_draw"] = upcoming["book_odds_draw"].map(
+            lambda v: format_odds_display(v) if pd.notna(v) else ""
+        )
+        upcoming["disp_book_odds_away"] = upcoming["book_odds_away"].map(
+            lambda v: format_odds_display(v) if pd.notna(v) else ""
+        )
+        upcoming["disp_book_prob_home"] = upcoming["book_prob_home"].map(
+            lambda v: f"{v*100:.1f}%" if pd.notna(v) else ""
+        )
+        upcoming["disp_book_prob_draw"] = upcoming["book_prob_draw"].map(
+            lambda v: f"{v*100:.1f}%" if pd.notna(v) else ""
+        )
+        upcoming["disp_book_prob_away"] = upcoming["book_prob_away"].map(
+            lambda v: f"{v*100:.1f}%" if pd.notna(v) else ""
+        )
         return upcoming
 
     def _compute_insights(self, df: pd.DataFrame):
         records = df.to_dict("records")
+        bookmaker_rows: list[dict[str, Any]] = []
+        prob_divergence_rows: list[dict[str, Any]] = []
+        value_edge_rows: list[dict[str, Any]] = []
         for r in records:
             probs = {"H": r["prob_home"], "D": r["prob_draw"], "A": r["prob_away"]}
             pred = max(probs.items(), key=lambda kv: kv[1])[0]
@@ -426,6 +738,59 @@ class State(rx.State):
                 r["pred_disp_odds"] = r["disp_odds_draw"]
                 r["pred_fair_odds"] = r["fair_odds_draw"]
 
+            r["book_available"] = bool(
+                pd.notna(r.get("book_prob_home"))
+                and pd.notna(r.get("book_prob_draw"))
+                and pd.notna(r.get("book_prob_away"))
+                and pd.notna(r.get("book_odds_home"))
+                and pd.notna(r.get("book_odds_draw"))
+                and pd.notna(r.get("book_odds_away"))
+            )
+
+            if not r["book_available"]:
+                continue
+
+            bookmaker_rows.append({
+                "label": r["chart_label"],
+                "model_pick": r["model_pick"],
+                "m_home": r["disp_odds_home"],
+                "m_draw": r["disp_odds_draw"],
+                "m_away": r["disp_odds_away"],
+                "b_home": r["disp_book_odds_home"],
+                "b_draw": r["disp_book_odds_draw"],
+                "b_away": r["disp_book_odds_away"],
+            })
+
+            for outcome, label_o in [("H", "Home"), ("D", "Draw"), ("A", "Away")]:
+                model_p = {"H": r["prob_home"], "D": r["prob_draw"], "A": r["prob_away"]}[outcome]
+                book_p = {"H": r["book_prob_home"], "D": r["book_prob_draw"], "A": r["book_prob_away"]}[outcome]
+                edge = (model_p - book_p) * 100.0
+                prob_divergence_rows.append({
+                    "label": r["chart_label"],
+                    "outcome": label_o,
+                    "edge_pp": round(edge, 2),
+                    "edge_disp": f"{edge:+.2f} pp",
+                    "model_prob_disp": {"H": r["disp_prob_home"], "D": r["disp_prob_draw"], "A": r["disp_prob_away"]}[outcome],
+                    "book_prob_disp": {"H": r["disp_book_prob_home"], "D": r["disp_book_prob_draw"], "A": r["disp_book_prob_away"]}[outcome],
+                })
+
+            model_fair_map = {"H": r["fair_odds_home"], "D": r["fair_odds_draw"], "A": r["fair_odds_away"]}
+            book_odds_map = {"H": r["book_odds_home"], "D": r["book_odds_draw"], "A": r["book_odds_away"]}
+            for outcome in ("H", "D", "A"):
+                fair_odds = model_fair_map[outcome]
+                book_odds = book_odds_map[outcome]
+                if pd.notna(fair_odds) and pd.notna(book_odds) and float(fair_odds) > 0:
+                    edge_pct = (float(book_odds) / float(fair_odds) - 1.0) * 100.0
+                    value_edge_rows.append({
+                        "label": r["chart_label"],
+                        "outcome": outcome,
+                        "edge_pct": round(edge_pct, 2),
+                        "edge_disp": f"{edge_pct:+.2f}%",
+                        "model_fair_odds": format_odds_display(float(fair_odds)),
+                        "book_odds": format_odds_display(float(book_odds)),
+                        "edge_positive": bool(edge_pct >= 0),
+                    })
+
         self.safe_picks = [r for r in records if r["pred_prob"] > 0.65]
         # Coin flip: no clear favourite — best outcome probability under 50%
         self.coin_flips = [
@@ -445,23 +810,220 @@ class State(rx.State):
              "elo_positive": bool(r["elo_diff"] >= 0)}
             for r in records
         ]
+        self.bookmaker_rows = bookmaker_rows
+        self.prob_divergence_rows = sorted(
+            prob_divergence_rows,
+            key=lambda r: abs(r["edge_pp"]),
+            reverse=True,
+        )[:15]
+        self.value_edge_rows = sorted(
+            value_edge_rows,
+            key=lambda r: r["edge_pct"],
+            reverse=True,
+        )[:15]
+
+    def _fixture_signature(self, rows: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+        """Stable signature used to ensure cache matches current fixture list."""
+        return sorted(
+            (
+                str(r.get("date", "")),
+                str(r.get("home_team", "")),
+                str(r.get("away_team", "")),
+            )
+            for r in rows
+        )
+
+    def _load_predictions_cache_dict(self) -> tuple[dict[str, Any] | None, str]:
+        """Read cache JSON from PREDICTIONS_CACHE_URL if set, else predictions_cache.json."""
+        url = (
+            os.getenv("PREDICTIONS_CACHE_URL")
+            or os.getenv("AUGO_PREDICTIONS_CACHE_URL")
+            or ""
+        ).strip()
+        if url:
+            try:
+                r = requests.get(url, timeout=20)
+                r.raise_for_status()
+                return json.loads(r.text), ""
+            except Exception as e:
+                if not os.path.exists(CACHE_FILE):
+                    return None, f"remote cache failed ({e}); no local file"
+        if not os.path.exists(CACHE_FILE):
+            return None, "cache file missing"
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f), ""
+        except Exception:
+            return None, "cache unreadable"
+
+    def _try_load_predictions_cache(self) -> tuple[bool, str]:
+        cache, err = self._load_predictions_cache_dict()
+        if cache is None:
+            return False, err or "cache unavailable"
+
+        preds = cache.get("predictions")
+        if not isinstance(preds, list) or not preds:
+            return False, "cache has no predictions"
+
+        generated_at = pd.to_datetime(cache.get("generated_at"), errors="coerce")
+        if pd.isna(generated_at):
+            return False, "cache timestamp invalid"
+
+        now = pd.Timestamp.now(tz=generated_at.tz) if generated_at.tz is not None else pd.Timestamp.now()
+        age_hours = (now - generated_at).total_seconds() / 3600.0
+        if age_hours > CACHE_MAX_AGE_HOURS:
+            return False, f"cache stale ({age_hours:.1f}h old)"
+
+        cached_gw = str(cache.get("gameweek", "")).strip()
+        if cached_gw != str(self.gameweek_label).strip():
+            return False, f"cache gw mismatch ({cached_gw} vs {self.gameweek_label})"
+
+        fixture_rows = [{k: v for k, v in f.items() if k != "idx"} for f in self.fixtures]
+        cache_sig = self._fixture_signature(preds)
+        fixture_sig = self._fixture_signature(fixture_rows)
+        if cache_sig != fixture_sig:
+            return False, "cache fixtures mismatch"
+
+        self.predictions = preds
+        for i in range(len(self.predictions)):
+            self.predictions[i]["match_idx"] = i
+            self._ensure_poisson_defaults(self.predictions[i])
+        self._restore_user_picks_for_current_gw()
+        self._compute_insights(pd.DataFrame(self.predictions))
+        self.prediction_source = "cache"
+        self.prediction_source_note = generated_at.strftime("%Y-%m-%d %H:%M")
+        self._archive_current_cache_if_missing(cache)
+        return True, ""
+
+    def _archive_current_cache_if_missing(self, cache: dict[str, Any]):
+        """Write predictions_history/GW{N}.json if it doesn't yet exist."""
+        gw = _gw_int_from_label(self.gameweek_label)
+        if gw is None:
+            return
+        history_dir = os.path.join(APP_DIR, "predictions_history")
+        archive_path = os.path.join(history_dir, f"GW{gw}.json")
+        if os.path.exists(archive_path):
+            return
+        try:
+            os.makedirs(history_dir, exist_ok=True)
+            with open(archive_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2)
+        except Exception:
+            pass
+
+    def _load_predictions_live(self):
+        model, df_elo, _elo_key = self._load_model_and_elo()
+        raw = [{k: v for k, v in f.items() if k != "idx"} for f in self.fixtures]
+        upcoming = pd.DataFrame(raw)
+        upcoming["date"] = pd.to_datetime(upcoming["date"])
+        upcoming = self._compute_current_elo(upcoming, df_elo, _elo_key)
+        upcoming = self._predict_upcoming(upcoming, df_elo, model)
+        self.predictions = upcoming.to_dict("records")
+        for i in range(len(self.predictions)):
+            self.predictions[i]["match_idx"] = i
+            self._ensure_poisson_defaults(self.predictions[i])
+        self._restore_user_picks_for_current_gw()
+        self._compute_insights(upcoming)
+
+    @staticmethod
+    def _ensure_poisson_defaults(prediction: dict[str, Any]) -> None:
+        prediction.setdefault("lambda_home", 0.0)
+        prediction.setdefault("lambda_away", 0.0)
+        prediction.setdefault("disp_lambda_home", "—")
+        prediction.setdefault("disp_lambda_away", "—")
+        prediction.setdefault("poisson_prob_home", 0.0)
+        prediction.setdefault("poisson_prob_draw", 0.0)
+        prediction.setdefault("poisson_prob_away", 0.0)
+        prediction.setdefault("disp_poisson_prob_home", "—")
+        prediction.setdefault("disp_poisson_prob_draw", "—")
+        prediction.setdefault("disp_poisson_prob_away", "—")
+        prediction.setdefault("poisson_correct_scores", [])
+        prediction.setdefault("disp_poisson_correct_scores", "—")
+        prediction["explanation"] = build_explanation(prediction)
+        prediction.setdefault("explanation_summary", prediction["explanation"].get("driver_summary", ""))
+
+    def _restore_user_picks_for_current_gw(self):
+        """Populate self.user_picks from user_picks.json based on the current GW."""
+        n = len(self.predictions)
+        picks: list[str] = [""] * n
+        gw = _gw_int_from_label(self.gameweek_label)
+        if gw is not None:
+            saved = load_user_picks().get(gw, {})
+            for i, p in enumerate(self.predictions):
+                m_idx = int(p.get("match_idx", i))
+                pick = saved.get(m_idx, "")
+                if pick in ("H", "D", "A"):
+                    picks[i] = pick
+        self.user_picks = picks
+
+    def _rebuild_bankroll(self):
+        settings = load_bankroll()
+        archives = load_archived_predictions()
+        results = load_results()
+        summary = build_bankroll(archives, results, settings)
+        settings["current_bankroll"] = summary["current_bankroll"]
+        settings["ledger"] = summary["ledger"]
+        try:
+            save_bankroll(settings)
+        except Exception:
+            pass
+
+        self.bankroll_summary = {k: v for k, v in summary.items() if k not in ("ledger", "latest_ledger", "suggestions")}
+        self.bankroll_ledger = summary["latest_ledger"]
+        self.bankroll_suggestions = build_current_suggestions(
+            self.predictions,
+            float(summary["current_bankroll"]),
+            float(summary["risk_cap"]),
+        )
+        self.bankroll_starting_input = str(summary["starting_bankroll"])
+        self.bankroll_risk_cap_input = str(round(float(summary["risk_cap"]) * 100, 2))
+
+    def update_bankroll_starting(self, value: str):
+        self.bankroll_starting_input = value
+
+    def update_bankroll_risk_cap(self, value: str):
+        self.bankroll_risk_cap_input = value
+
+    def save_bankroll_settings(self):
+        try:
+            starting = max(float(self.bankroll_starting_input), 1.0)
+            risk_cap_pct = max(0.0, min(100.0, float(self.bankroll_risk_cap_input)))
+        except ValueError:
+            return rx.toast.error("Bankroll settings must be numbers.")
+        settings = load_bankroll()
+        settings["starting_bankroll"] = starting
+        settings["risk_cap"] = risk_cap_pct / 100.0
+        settings["current_bankroll"] = starting
+        settings["ledger"] = []
+        save_bankroll(settings)
+        self._rebuild_bankroll()
+        return rx.toast.success("Bankroll settings saved.")
 
     def load_predictions(self):
         self.load_fixtures_from_csv()
+        self.prediction_source = ""
+        self.prediction_source_note = ""
+
+        cache_ok, cache_reason = self._try_load_predictions_cache()
         try:
-            model, df_elo = self._load_model_and_elo()
-            raw = [{k: v for k, v in f.items() if k != "idx"} for f in self.fixtures]
-            upcoming = pd.DataFrame(raw)
-            upcoming["date"] = pd.to_datetime(upcoming["date"])
-            upcoming = self._compute_current_elo(upcoming, df_elo)
-            upcoming = self._predict_upcoming(upcoming, df_elo, model)
-            self.predictions = upcoming.to_dict("records")
-            # Add match index to each prediction
-            for i in range(len(self.predictions)):
-                self.predictions[i]["match_idx"] = i
-            # Reset user picks
-            self.user_picks = [""] * len(self.predictions)
-            self._compute_insights(upcoming)
+            self._rebuild_history()
+        except Exception:
+            pass
+        try:
+            self._rebuild_bankroll()
+        except Exception:
+            pass
+
+        if cache_ok:
+            return rx.toast.success("Loaded cached predictions.")
+
+        try:
+            self._load_predictions_live()
+            self.prediction_source = "live"
+            self.prediction_source_note = cache_reason
+            self._rebuild_bankroll()
+            reason = cache_reason if cache_reason else "cache unavailable"
+            return rx.toast.warning(f"Using live inference: {reason}")
         except Exception as e:
             return rx.toast.error(f"Prediction error: {e}")
 
@@ -471,14 +1033,14 @@ class State(rx.State):
         if self.custom_home == self.custom_away:
             return rx.toast.error("Pick two different teams.")
         try:
-            model, df_elo = self._load_model_and_elo()
+            model, df_elo, _elo_key = self._load_model_and_elo()
             df = pd.DataFrame([{
-                "date": str(pd.Timestamp.today().date()),
+                "date": str(_local_today_hk().date()),
                 "home_team": self.custom_home,
                 "away_team": self.custom_away,
             }])
             df["date"] = pd.to_datetime(df["date"])
-            df = self._compute_current_elo(df, df_elo)
+            df = self._compute_current_elo(df, df_elo, _elo_key)
             df = self._predict_upcoming(df, df_elo, model)
             self.custom_result = df.to_dict("records")
         except Exception as e:
@@ -495,49 +1057,28 @@ class State(rx.State):
         self.user_picks = picks
 
     def lock_in_picks(self):
-        """Save current GW predictions + user picks to history."""
+        """Persist user picks to disk for the current GW, then refresh history."""
         if not self.predictions:
             return rx.toast.error("No predictions loaded.")
         if not self.all_picked:
             return rx.toast.error("Pick an outcome for every match first.")
 
-        matches = []
-        for i, p in enumerate(self.predictions):
-            user_pick = self.user_picks[i] if i < len(self.user_picks) else ""
-            model_pick = p.get("model_pick", "")
-            matches.append({
-                "home_team":      p["home_team"],
-                "away_team":      p["away_team"],
-                "badge_home":     p["badge_home"],
-                "badge_away":     p["badge_away"],
-                "disp_odds_home": p["disp_odds_home"],
-                "disp_odds_draw": p["disp_odds_draw"],
-                "disp_odds_away": p["disp_odds_away"],
-                "disp_prob_home": p["disp_prob_home"],
-                "disp_prob_draw": p["disp_prob_draw"],
-                "disp_prob_away": p["disp_prob_away"],
-                "prob_home":      p["prob_home"],
-                "prob_draw":      p["prob_draw"],
-                "prob_away":      p["prob_away"],
-                "fair_odds_home": p["fair_odds_home"],
-                "fair_odds_draw": p["fair_odds_draw"],
-                "fair_odds_away": p["fair_odds_away"],
-                "actual":         "",
-                "user_pick":      user_pick,
-                "model_pick":     model_pick,
-            })
+        gw = _gw_int_from_label(self.gameweek_label)
+        if gw is None:
+            return rx.toast.error("Could not determine current gameweek number.")
 
-        entry = {
-            "idx":            len(self.history),
-            "gw":             self.gameweek_label,
-            "date":           self.fixtures[0]["date"] if self.fixtures else "",
-            "matches":        matches,
-            "model_accuracy": "",
-            "user_accuracy":  "",
-            "pnl":            "",
-            "pnl_positive":   False,
-        }
-        self.history.append(entry)
+        picks_by_idx: dict[int, str] = {}
+        for i, p in enumerate(self.predictions):
+            pick = self.user_picks[i] if i < len(self.user_picks) else ""
+            if pick in ("H", "D", "A"):
+                picks_by_idx[int(p.get("match_idx", i))] = pick
+
+        try:
+            upsert_user_picks_for_gw(gw, picks_by_idx)
+        except Exception as e:
+            return rx.toast.error(f"Failed to save picks: {e}")
+
+        self._rebuild_history()
         agree = self.picks_agree_count
         total = self.total_fixtures
         return rx.toast.success(
@@ -553,18 +1094,97 @@ class State(rx.State):
         self.history_selected = -1
 
     def set_actual_result(self, gw_idx: int, match_idx: int, result: str):
-        """Mark actual result and recalculate both user and model accuracy."""
-        self.history[gw_idx]["matches"][match_idx]["actual"] = result
-        self._recalculate_history(gw_idx)
+        """Deprecated: actual results now come from results.csv automatically."""
+        return None
 
-    def _recalculate_history(self, gw_idx: int):
-        matches = self.history[gw_idx]["matches"]
+    def _rebuild_history(self):
+        """Rebuild self.history from disk (archives + results.csv + user_picks.json)."""
+        archives = load_archived_predictions()
+        results = load_results()
+        all_user_picks = load_user_picks()
+
+        entries: list[dict[str, Any]] = []
+        for gw in sorted(archives.keys(), reverse=True):
+            cache = archives[gw]
+            preds = cache.get("predictions", []) if isinstance(cache, dict) else []
+            if not preds:
+                continue
+            picks_for_gw = all_user_picks.get(gw, {})
+
+            matches: list[dict[str, Any]] = []
+            for i, p in enumerate(preds):
+                if not isinstance(p, dict):
+                    continue
+                home = str(p.get("home_team", ""))
+                away = str(p.get("away_team", ""))
+                key = (gw, home, away)
+                actual = ""
+                home_goals = ""
+                away_goals = ""
+                if key in results:
+                    actual = results[key]["actual"]
+                    home_goals = str(results[key]["home_goals"])
+                    away_goals = str(results[key]["away_goals"])
+                m_idx = int(p.get("match_idx", i))
+                date_str = str(p.get("date", "")) if p.get("date") is not None else ""
+                if date_str:
+                    date_str = date_str.split("T")[0].split(" ")[0]
+                matches.append({
+                    "date":           date_str,
+                    "home_team":      home,
+                    "away_team":      away,
+                    "badge_home":     p.get("badge_home", FALLBACK_BADGE),
+                    "badge_away":     p.get("badge_away", FALLBACK_BADGE),
+                    "disp_odds_home": p.get("disp_odds_home", ""),
+                    "disp_odds_draw": p.get("disp_odds_draw", ""),
+                    "disp_odds_away": p.get("disp_odds_away", ""),
+                    "disp_prob_home": p.get("disp_prob_home", ""),
+                    "disp_prob_draw": p.get("disp_prob_draw", ""),
+                    "disp_prob_away": p.get("disp_prob_away", ""),
+                    "prob_home":      float(p.get("prob_home", 0.0) or 0.0),
+                    "prob_draw":      float(p.get("prob_draw", 0.0) or 0.0),
+                    "prob_away":      float(p.get("prob_away", 0.0) or 0.0),
+                    "fair_odds_home": float(p.get("fair_odds_home", 0.0) or 0.0),
+                    "fair_odds_draw": float(p.get("fair_odds_draw", 0.0) or 0.0),
+                    "fair_odds_away": float(p.get("fair_odds_away", 0.0) or 0.0),
+                    "actual":         actual,
+                    "home_goals":     home_goals,
+                    "away_goals":     away_goals,
+                    "user_pick":      picks_for_gw.get(m_idx, ""),
+                    "model_pick":     str(p.get("model_pick", "")),
+                    "match_idx":      m_idx,
+                })
+
+            entry = self._summarize_history_entry(gw, matches, cache)
+            entry["idx"] = len(entries)
+            entries.append(entry)
+
+        self.history = entries
+        if self.history_selected >= len(self.history):
+            self.history_selected = -1
+
+    @staticmethod
+    def _summarize_history_entry(
+        gw: int,
+        matches: list[dict[str, Any]],
+        cache: dict[str, Any],
+    ) -> dict[str, Any]:
         completed = [m for m in matches if m["actual"] in ("H", "D", "A")]
-        if not completed:
-            self.history[gw_idx]["model_accuracy"] = ""
-            self.history[gw_idx]["user_accuracy"] = ""
-            self.history[gw_idx]["pnl"] = ""
-            return
+        gw_label = str(cache.get("gameweek") or f"GW{gw}")
+        first_date = matches[0].get("date", "") if matches else ""
+
+        n = len(completed)
+        if n == 0:
+            return {
+                "gw":             gw_label,
+                "gw_num":         gw,
+                "date":           first_date,
+                "matches":        matches,
+                "model_accuracy": "",
+                "user_accuracy":  "",
+                "pnl":            "",
+                "pnl_positive":   False,
+            }
 
         model_correct = 0
         user_correct = 0
@@ -574,13 +1194,10 @@ class State(rx.State):
             actual = m["actual"]
             model_pick = m.get("model_pick", "")
             user_pick = m.get("user_pick", "")
-
             if model_pick == actual:
                 model_correct += 1
             if user_pick == actual:
                 user_correct += 1
-
-            # P&L based on model (flat £1 stake on model's pick)
             odds_map = {
                 "H": m["fair_odds_home"],
                 "D": m["fair_odds_draw"],
@@ -591,15 +1208,25 @@ class State(rx.State):
             elif model_pick:
                 pnl -= 1.0
 
-        n = len(completed)
         model_acc = model_correct / n * 100
         user_acc = user_correct / n * 100
+        return {
+            "gw":             gw_label,
+            "gw_num":         gw,
+            "date":           first_date,
+            "matches":        matches,
+            "model_accuracy": f"{model_acc:.0f}%  ({model_correct}/{n})",
+            "user_accuracy":  f"{user_acc:.0f}%  ({user_correct}/{n})",
+            "pnl":            format_money(pnl, signed=True),
+            "pnl_positive":   bool(pnl >= 0),
+        }
 
-        self.history[gw_idx]["model_accuracy"] = f"{model_acc:.0f}%  ({model_correct}/{n})"
-        self.history[gw_idx]["user_accuracy"]  = f"{user_acc:.0f}%  ({user_correct}/{n})"
-        sign = "+" if pnl >= 0 else ""
-        self.history[gw_idx]["pnl"] = f"{sign}{pnl:.2f} u"
-        self.history[gw_idx]["pnl_positive"] = bool(pnl >= 0)
+
+def _gw_int_from_label(label: str) -> int | None:
+    if not label:
+        return None
+    m = re.search(r"\d+", str(label))
+    return int(m.group(0)) if m else None
 
 
 # ── Shared UI helpers ─────────────────────────────────────────────────────────
@@ -617,6 +1244,69 @@ def odds_col(label: str, odds, prob, color: str) -> rx.Component:
         spacing="1",
         align="center",
         width="33%",
+    )
+
+
+def poisson_summary(p: dict) -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.text("POISSON", color="#555", font_size="0.58em", letter_spacing="0.12em", font_weight="700"),
+            rx.spacer(),
+            rx.text("λ ", color="#555", font_size="0.62em"),
+            rx.text(p["disp_lambda_home"], color="#4CAF50", font_size="0.66em", font_weight="700"),
+            rx.text("-", color="#333", font_size="0.66em"),
+            rx.text(p["disp_lambda_away"], color="#F44336", font_size="0.66em", font_weight="700"),
+            width="100%",
+            align="center",
+            spacing="1",
+        ),
+        rx.hstack(
+            rx.text("H ", rx.text.span(p["disp_poisson_prob_home"], font_weight="700"), color="#4CAF50", font_size="0.62em"),
+            rx.text("D ", rx.text.span(p["disp_poisson_prob_draw"], font_weight="700"), color="#FFC107", font_size="0.62em"),
+            rx.text("A ", rx.text.span(p["disp_poisson_prob_away"], font_weight="700"), color="#F44336", font_size="0.62em"),
+            spacing="3",
+            width="100%",
+        ),
+        rx.text(
+            p["disp_poisson_correct_scores"],
+            color="#777",
+            font_size="0.62em",
+            width="100%",
+            no_of_lines=1,
+        ),
+        spacing="2",
+        width="100%",
+        padding="8px 10px",
+        background_color="#0f0f0f",
+        border="1px solid #1b1b1b",
+        border_radius="7px",
+    )
+
+
+def explanation_summary(p: dict) -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.text("WHY", color="#555", font_size="0.58em", letter_spacing="0.12em", font_weight="700"),
+            rx.spacer(),
+            rx.text("Pick ", color="#555", font_size="0.62em"),
+            rx.text(p["model_pick"], color="#ddd", font_size="0.66em", font_weight="700"),
+            width="100%",
+            align="center",
+            spacing="1",
+        ),
+        rx.text(
+            p["explanation_summary"],
+            color="#aaa",
+            font_size="0.66em",
+            line_height="1.35",
+            width="100%",
+        ),
+        spacing="2",
+        width="100%",
+        padding="8px 10px",
+        background_color="#101010",
+        border="1px solid #1b1b1b",
+        border_radius="7px",
     )
 
 
@@ -642,6 +1332,8 @@ def match_card(p: dict) -> rx.Component:
                 width="100%",
                 justify="between",
             ),
+            poisson_summary(p),
+            explanation_summary(p),
             spacing="3",
             align="center",
             width="100%",
@@ -670,7 +1362,7 @@ def home_tab() -> rx.Component:
                 rx.hstack(
                     section_label(State.gameweek_label),
                     rx.spacer(),
-                    rx.text("Model Predictions", color="#444", font_size="0.7em"),
+                    rx.text(State.prediction_source_label, color=State.prediction_source_color, font_size="0.7em"),
                     width="100%",
                     align="center",
                     padding_bottom="6px",
@@ -929,38 +1621,41 @@ def coin_flip_row(p: dict) -> rx.Component:
     )
 
 
+def _prob_bar(label: str, value, color: str) -> rx.Component:
+    return rx.hstack(
+        rx.text(label, color="#888", font_size="0.6em", width="18px", flex_shrink="0",
+                text_align="right"),
+        rx.box(
+            rx.text(value.to_string() + "%", color="white", font_size="0.55em",
+                    padding_x="4px", white_space="nowrap"),
+            background_color=color,
+            border_radius="3px",
+            height="16px",
+            min_width="28px",
+            width=value.to_string() + "%",
+            display="flex",
+            align_items="center",
+        ),
+        spacing="2",
+        width="100%",
+        align="center",
+    )
+
+
 def chart_bar_row(item: dict) -> rx.Component:
     return rx.vstack(
-        rx.text(item["label"], color="#555", font_size="0.65em", letter_spacing="0.04em"),
-        rx.hstack(
-            rx.box(
-                rx.text(item["home"], color="white", font_size="0.6em", padding_x="3px"),
-                background_color="#4CAF50",
-                border_radius="2px 0 0 2px",
-                height="14px",
-                width=item["home"].to_string() + "%",
-                display="flex", align_items="center",
-            ),
-            rx.box(
-                rx.text(item["draw"], color="white", font_size="0.6em", padding_x="3px"),
-                background_color="#FFC107",
-                height="14px",
-                width=item["draw"].to_string() + "%",
-                display="flex", align_items="center",
-            ),
-            rx.box(
-                rx.text(item["away"], color="white", font_size="0.6em", padding_x="3px"),
-                background_color="#F44336",
-                border_radius="0 2px 2px 0",
-                height="14px",
-                width=item["away"].to_string() + "%",
-                display="flex", align_items="center",
-            ),
-            spacing="0",
+        rx.text(item["label"], color="#ccc", font_size="0.7em", font_weight="600",
+                letter_spacing="0.04em"),
+        rx.vstack(
+            _prob_bar("H", item["home"], "#4CAF50"),
+            _prob_bar("D", item["draw"], "#FFC107"),
+            _prob_bar("A", item["away"], "#F44336"),
+            spacing="1",
             width="100%",
         ),
         spacing="1",
         width="100%",
+        padding_bottom="6px",
     )
 
 
@@ -977,6 +1672,61 @@ def elo_bar_row(item: dict) -> rx.Component:
             display="flex",
             align_items="center",
         ),
+        width="100%",
+        align="center",
+        spacing="2",
+    )
+
+
+def _odds_pair(label: str, model_val, book_val) -> rx.Component:
+    """Single H/D/A column showing model vs book odds stacked."""
+    return rx.vstack(
+        rx.text(label, color="#666", font_size="0.6em", font_weight="600"),
+        rx.text(model_val, color="#ccc", font_size="0.68em"),
+        rx.text(book_val, color="#6fb6ff", font_size="0.68em"),
+        spacing="0",
+        align="center",
+        width="60px",
+    )
+
+
+def bookmaker_odds_row(item: dict) -> rx.Component:
+    return rx.hstack(
+        rx.text(item["label"], color="#bbb", font_size="0.72em", width="72px", flex_shrink="0"),
+        rx.text(item["model_pick"], color="#FF9800", font_size="0.68em", width="20px"),
+        _odds_pair("H", item["m_home"], item["b_home"]),
+        _odds_pair("D", item["m_draw"], item["b_draw"]),
+        _odds_pair("A", item["m_away"], item["b_away"]),
+        width="100%",
+        align="center",
+        spacing="2",
+    )
+
+
+def prob_divergence_row(item: dict) -> rx.Component:
+    return rx.hstack(
+        rx.text(item["label"], color="#bbb", font_size="0.72em", width="72px", flex_shrink="0"),
+        rx.text(item["outcome"], color="#888", font_size="0.68em", width="38px"),
+        rx.text(item["edge_disp"],
+                color=rx.cond(item["edge_pp"].to(float) >= 0, "#4CAF50", "#F44336"),
+                font_size="0.70em", font_weight="600", width="60px"),
+        rx.text("M ", rx.text.span(item["model_prob_disp"]), color="#888", font_size="0.66em", width="62px"),
+        rx.text("B ", rx.text.span(item["book_prob_disp"]), color="#6fb6ff", font_size="0.66em"),
+        width="100%",
+        align="center",
+        spacing="2",
+    )
+
+
+def value_edge_row(item: dict) -> rx.Component:
+    return rx.hstack(
+        rx.text(item["label"], color="#bbb", font_size="0.72em", width="72px", flex_shrink="0"),
+        rx.text(item["outcome"], color="#FF9800", font_size="0.68em", width="20px"),
+        rx.text(item["edge_disp"],
+                color=rx.cond(item["edge_positive"], "#4CAF50", "#F44336"),
+                font_size="0.70em", font_weight="600", width="60px"),
+        rx.text("M ", rx.text.span(item["model_fair_odds"]), color="#888", font_size="0.66em", width="56px"),
+        rx.text("B ", rx.text.span(item["book_odds"]), color="#6fb6ff", font_size="0.66em"),
         width="100%",
         align="center",
         spacing="2",
@@ -1015,6 +1765,63 @@ def insights_tab() -> rx.Component:
                     rx.vstack(
                         rx.foreach(State.win_prob_chart.to(list[dict[str, Any]]), chart_bar_row),
                         spacing="3", width="100%",
+                    ),
+                ),
+                insight_card(
+                    "BOOKMAKER VS MODEL ODDS  ( H / D / A )",
+                    rx.cond(
+                        State.bookmaker_rows.length() > 0,
+                        rx.vstack(
+                            rx.hstack(
+                                rx.text("", width="72px"),
+                                rx.text("", width="20px"),
+                                rx.text("Model", color="#888", font_size="0.58em", width="60px", text_align="center"),
+                                rx.text("", width="0px"),
+                                rx.text("", width="60px"),
+                                rx.text("Book", color="#6fb6ff", font_size="0.58em", width="60px", text_align="center"),
+                                width="100%", spacing="2",
+                            ),
+                            rx.foreach(State.bookmaker_rows.to(list[dict[str, Any]]), bookmaker_odds_row),
+                            spacing="2",
+                            width="100%",
+                        ),
+                        rx.text(
+                            "No bookmaker odds found in cached predictions for this gameweek.",
+                            color="#555",
+                            font_size="0.8em",
+                        ),
+                    ),
+                ),
+                insight_card(
+                    "PROBABILITY DIVERGENCE  (model - book, per outcome)",
+                    rx.cond(
+                        State.prob_divergence_rows.length() > 0,
+                        rx.vstack(
+                            rx.foreach(State.prob_divergence_rows.to(list[dict[str, Any]]), prob_divergence_row),
+                            spacing="2",
+                            width="100%",
+                        ),
+                        rx.text(
+                            "No probability divergence available without bookmaker probabilities.",
+                            color="#555",
+                            font_size="0.8em",
+                        ),
+                    ),
+                ),
+                insight_card(
+                    "FAIR-ODDS EDGE  (book / model fair odds - 1, per outcome)",
+                    rx.cond(
+                        State.value_edge_rows.length() > 0,
+                        rx.vstack(
+                            rx.foreach(State.value_edge_rows.to(list[dict[str, Any]]), value_edge_row),
+                            spacing="2",
+                            width="100%",
+                        ),
+                        rx.text(
+                            "No fair-odds edge available without bookmaker odds.",
+                            color="#555",
+                            font_size="0.8em",
+                        ),
                     ),
                 ),
                 insight_card(
@@ -1065,25 +1872,42 @@ def pick_chip(label: str, color: str, is_correct: bool, has_actual: bool) -> rx.
     )
 
 
-def actual_btn(gw_idx: int, match_idx: int, label: str, outcome: str, current_actual: str) -> rx.Component:
-    is_set = current_actual == outcome
-    color_map = {"H": "#4CAF50", "D": "#FFC107", "A": "#F44336"}
-    c = color_map.get(outcome, "#888")
-    return rx.box(
-        rx.text(label, font_size="0.7em", font_weight="700",
-                color=rx.cond(is_set, "#0E1117", "#666")),
-        on_click=State.set_actual_result(gw_idx, match_idx, outcome),
-        background_color=rx.cond(is_set, c, "#1a1a1a"),
-        border=f"1px solid {c}",
-        border_radius="4px",
-        padding="4px 10px",
-        cursor="pointer",
+def actual_chip(actual: str, home_goals: str, away_goals: str) -> rx.Component:
+    """Read-only result chip; shows H/D/A + score, or 'Pending' when no result yet."""
+    has_actual = actual != ""
+    score = rx.cond(
+        (home_goals != "") & (away_goals != ""),
+        rx.hstack(
+            rx.text(home_goals, color="#bbb", font_size="0.72em", font_weight="700"),
+            rx.text("-", color="#666", font_size="0.72em", font_weight="700"),
+            rx.text(away_goals, color="#bbb", font_size="0.72em", font_weight="700"),
+            spacing="1",
+            align="center",
+        ),
+        rx.box(),
+    )
+    return rx.cond(
+        has_actual,
+        rx.hstack(
+            rx.text(actual, color="white", font_size="0.72em", font_weight="700"),
+            score,
+            spacing="2",
+            align="center",
+            padding="4px 10px",
+            background_color="#1a1a1a",
+            border="1px solid #2a2a2a",
+            border_radius="6px",
+        ),
+        rx.text("Pending", color="#555", font_size="0.7em",
+                padding="4px 10px",
+                background_color="#1a1a1a",
+                border="1px dashed #2a2a2a",
+                border_radius="6px"),
     )
 
 
 def history_match_detail_row(m: dict) -> rx.Component:
-    """Detailed row in expanded GW view: user pick, model pick, actual input."""
-    gw_idx   = State.history_selected
+    """Detailed row in expanded GW view: user pick, model pick, actual (read-only)."""
     has_actual = m["actual"] != ""
     user_correct  = m["user_pick"]  == m["actual"]
     model_correct = m["model_pick"] == m["actual"]
@@ -1119,15 +1943,10 @@ def history_match_detail_row(m: dict) -> rx.Component:
                     spacing="1", align="center",
                 ),
                 rx.spacer(),
-                # Actual result buttons
+                # Actual result (read-only, from results.csv)
                 rx.vstack(
                     rx.text("RESULT", color="#555", font_size="0.55em", letter_spacing="0.1em"),
-                    rx.hstack(
-                        actual_btn(gw_idx, m["match_idx"], "H", "H", m["actual"]),
-                        actual_btn(gw_idx, m["match_idx"], "D", "D", m["actual"]),
-                        actual_btn(gw_idx, m["match_idx"], "A", "A", m["actual"]),
-                        spacing="1",
-                    ),
+                    actual_chip(m["actual"], m["home_goals"], m["away_goals"]),
                     spacing="1",
                     align="end",
                 ),
@@ -1274,7 +2093,7 @@ def history_detail_view() -> rx.Component:
                 spacing="2",
             ),
             rx.box(
-                rx.text("Tap H / D / A on each match to enter results",
+                rx.text("Awaiting results. Update results.csv after the matches play.",
                         color="#333", font_size="0.72em"),
                 text_align="center", padding_y="6px", width="100%",
             ),
@@ -1307,7 +2126,7 @@ def history_tab() -> rx.Component:
                     rx.vstack(
                         rx.icon("clock", size=32, color="#222"),
                         rx.text("No history yet.", color="#444", font_size="0.85em"),
-                        rx.text("Head to Predictor, make your picks, and lock them in.",
+                        rx.text("Run python run_pipeline.py for a gameweek to start populating history.",
                                 color="#333", font_size="0.75em", text_align="center"),
                         spacing="2",
                         align="center",
@@ -1327,6 +2146,185 @@ def history_tab() -> rx.Component:
     )
 
 
+# ── Bankroll tab ──────────────────────────────────────────────────────────────
+
+def bankroll_stat(label: str, value, color: str = "white") -> rx.Component:
+    return rx.box(
+        rx.vstack(
+            rx.text(label, color="#555", font_size="0.6em", letter_spacing="0.1em", font_weight="700"),
+            rx.text(value, color=color, font_size="0.95em", font_weight="700"),
+            spacing="1",
+            align="center",
+        ),
+        flex="1",
+        padding="10px 8px",
+        background_color="#141414",
+        border="1px solid #1e1e1e",
+        border_radius="8px",
+    )
+
+
+def bankroll_bet_row(bet: dict) -> rx.Component:
+    status_color = rx.cond(
+        bet["status"] == "win",
+        "#4CAF50",
+        rx.cond(bet["status"] == "loss", "#F44336", "#888"),
+    )
+    return rx.box(
+        rx.vstack(
+            rx.hstack(
+                rx.text(bet["gw"], color="#555", font_size="0.65em", font_weight="700"),
+                rx.hstack(
+                    rx.text(bet["home_team"], color="#ddd", font_size="0.72em", no_of_lines=1),
+                    rx.text("vs", color="#444", font_size="0.65em"),
+                    rx.text(bet["away_team"], color="#ddd", font_size="0.72em", no_of_lines=1),
+                    flex="1",
+                    spacing="1",
+                    align="center",
+                ),
+                rx.text(bet["status"], color=status_color, font_size="0.65em", font_weight="700"),
+                width="100%",
+                align="center",
+                spacing="2",
+            ),
+            rx.hstack(
+                rx.text("Bet ", rx.text.span(bet["bet_outcome"], font_weight="700"), color="#aaa", font_size="0.66em"),
+                rx.text("Odds ", rx.text.span(bet["odds"].to_string(), font_weight="700"), color="#777", font_size="0.66em"),
+                rx.text("Stake ", rx.text.span(bet["stake_disp"], font_weight="700"), color="#777", font_size="0.66em"),
+                rx.spacer(),
+                rx.text(bet["pnl_disp"], color=status_color, font_size="0.68em", font_weight="700"),
+                width="100%",
+                align="center",
+            ),
+            rx.text("Edge ", rx.text.span(bet["edge_disp"]), " · Kelly ", rx.text.span(bet["kelly_disp"]), color="#555", font_size="0.62em"),
+            spacing="1",
+            width="100%",
+        ),
+        padding="10px 12px",
+        background_color="#101010",
+        border="1px solid #1b1b1b",
+        border_radius="7px",
+        width="100%",
+    )
+
+
+def bankroll_suggestion_row(bet: dict) -> rx.Component:
+    return rx.box(
+        rx.vstack(
+            rx.hstack(
+                rx.text(bet["match"], color="#ddd", font_size="0.72em", flex="1", no_of_lines=1),
+                rx.text(bet["bet_outcome"], color="#4CAF50", font_size="0.7em", font_weight="700"),
+                width="100%",
+                align="center",
+            ),
+            rx.text(
+                "Edge ",
+                rx.text.span(bet["edge_disp"]),
+                " · Stake ",
+                rx.text.span(bet["stake_disp"]),
+                " · Kelly ",
+                rx.text.span(bet["kelly_disp"]),
+                color="#666",
+                font_size="0.62em",
+            ),
+            spacing="1",
+            width="100%",
+        ),
+        padding="9px 11px",
+        background_color="#101010",
+        border="1px solid #1b1b1b",
+        border_radius="7px",
+        width="100%",
+    )
+
+
+def bankroll_tab() -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            bankroll_stat("BANKROLL", State.bankroll_summary["current_bankroll_disp"], "white"),
+            bankroll_stat("P/L", State.bankroll_summary["total_pnl_disp"], rx.cond(State.bankroll_summary["pnl_positive"], "#4CAF50", "#F44336")),
+            bankroll_stat("ROI", State.bankroll_summary["roi_disp"], "#FFB74D"),
+            width="100%",
+            spacing="2",
+        ),
+        rx.hstack(
+            bankroll_stat("RECORD", State.bankroll_summary["record"], "#aaa"),
+            bankroll_stat("PENDING", State.bankroll_summary["pending_count"].to_string(), "#888"),
+            bankroll_stat("RISK CAP", State.bankroll_summary["risk_cap_disp"], "#6C63FF"),
+            width="100%",
+            spacing="2",
+        ),
+        rx.box(
+            rx.vstack(
+                section_label("BANKROLL SETTINGS"),
+                rx.hstack(
+                    rx.vstack(
+                        rx.text("Starting balance used to size stakes.", color="#777", font_size="0.68em"),
+                        rx.input(
+                            value=State.bankroll_starting_input,
+                            on_change=State.update_bankroll_starting,
+                            placeholder="Starting bankroll",
+                            width="100%",
+                            background_color="#101010",
+                            color="white",
+                            border="1px solid #242424",
+                        ),
+                        width="50%",
+                        spacing="1",
+                    ),
+                    rx.vstack(
+                        rx.text("Max % of bankroll to stake per bet (safety limit).", color="#777", font_size="0.68em"),
+                        rx.input(
+                            value=State.bankroll_risk_cap_input,
+                            on_change=State.update_bankroll_risk_cap,
+                            placeholder="Risk cap %",
+                            width="100%",
+                            background_color="#101010",
+                            color="white",
+                            border="1px solid #242424",
+                        ),
+                        width="50%",
+                        spacing="1",
+                    ),
+                    width="100%",
+                    spacing="2",
+                ),
+                rx.button("Save Settings", on_click=State.save_bankroll_settings, width="100%", background_color="#1a1a1a", color="white"),
+                rx.text("Saving resets bankroll and clears the ledger.", color="#555", font_size="0.64em", text_align="center", width="100%"),
+                spacing="2",
+                width="100%",
+            ),
+            width="100%",
+            padding="12px",
+            background_color="#141414",
+            border="1px solid #1e1e1e",
+            border_radius="8px",
+        ),
+        section_label("CURRENT VALUE BETS"),
+        rx.cond(
+            State.bankroll_suggestions.length() == 0,
+            rx.text("No positive-edge bookmaker bets available for the current cache.", color="#444", font_size="0.75em"),
+            rx.vstack(
+                rx.foreach(State.bankroll_suggestions.to(list[dict[str, Any]]), bankroll_suggestion_row),
+                width="100%",
+                spacing="2",
+            ),
+        ),
+        section_label("LEDGER"),
+        rx.cond(
+            State.bankroll_ledger.length() == 0,
+            rx.text("No bankroll bets yet. Run the pipeline with bookmaker odds to populate suggestions.", color="#444", font_size="0.75em"),
+            rx.vstack(
+                rx.foreach(State.bankroll_ledger.to(list[dict[str, Any]]), bankroll_bet_row),
+                width="100%",
+                spacing="2",
+            ),
+        ),
+        width="100%",
+        spacing="3",
+    )
+
+
 # ── Navbar ────────────────────────────────────────────────────────────────────
 
 NAV_ITEMS = [
@@ -1334,6 +2332,7 @@ NAV_ITEMS = [
     ("predictor", "Predictor", "crosshair"),
     ("insights",  "Insights",  "bar-chart-2"),
     ("history",   "History",   "clock"),
+    ("bankroll",  "Bankroll",  "wallet"),
 ]
 
 
@@ -1349,7 +2348,7 @@ def nav_btn(tab: str, label: str, icon: str) -> rx.Component:
             align="center",
         ),
         on_click=State.set_current_tab(tab),
-        width="25%",
+        width="20%",
         height="56px",
         display="flex",
         align_items="center",
@@ -1390,7 +2389,11 @@ def index() -> rx.Component:
                 rx.cond(
                     State.current_tab == "history",
                     history_tab(),
-                    rx.box(),
+                    rx.cond(
+                        State.current_tab == "bankroll",
+                        bankroll_tab(),
+                        rx.box(),
+                    ),
                 ),
             ),
         ),

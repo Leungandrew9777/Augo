@@ -2,7 +2,7 @@ import reflex as rx
 
 config = rx.Config(
     app_name="Augo",
-    # These settings make it more mobile-friendly
+    app_module_import="app",
     frontend_port=3000,
     backend_port=8000,
 )

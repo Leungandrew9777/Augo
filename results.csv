@@ -1,71 +1,72 @@
 ﻿date,gameweek,home_team,away_team,home_goals,away_goals
-2026-04-11,32,West Ham United,Wolverhampton Wanderers,4,0
-2026-04-11,32,Arsenal,Bournemouth,1,2
-2026-04-11,32,Brentford,Everton,2,2
-2026-04-11,32,Burnley,Brighton & Hove Albion,0,2
-2026-04-12,32,Liverpool,Fulham,2,0
-2026-04-12,32,Crystal Palace,Newcastle,2,1
-2026-04-12,32,Nottingham Forest,Aston Villa,1,1
-2026-04-12,32,Sunderland,Tottenham Hotspur,1,0
-2026-04-12,32,Chelsea,Manchester City,0,3
-2026-04-14,32,Manchester United,Leeds United,1,2
-2026-04-18,33,Brentford,Fulham,,
-2026-04-18,33,Leeds United,Wolverhampton Wanderers,,
-2026-04-18,33,Newcastle,Bournemouth,,
-2026-04-19,33,Tottenham Hotspur,Brighton & Hove Albion,,
-2026-04-19,33,Chelsea,Manchester United,,
-2026-04-19,33,Aston Villa,Sunderland,,
-2026-04-19,33,Everton,Liverpool,,
-2026-04-19,33,Nottingham Forest,Burnley,,
-2026-04-19,33,Manchester City,Arsenal,,
-2026-04-21,33,Crystal Palace,West Ham United,,
-2026-04-22,34,Brighton & Hove Albion,Chelsea,,
-2026-04-23,34,Bournemouth,Leeds United,,
-2026-04-23,34,Burnley,Manchester City,,
-2026-04-25,34,Sunderland,Nottingham Forest,,
-2026-04-25,34,Fulham,Aston Villa,,
-2026-04-25,34,Liverpool,Crystal Palace,,
-2026-04-25,34,West Ham United,Everton,,
-2026-04-25,34,Wolverhampton Wanderers,Tottenham Hotspur,,
-2026-04-26,34,Arsenal,Newcastle,,
-2026-04-28,34,Manchester United,Brentford,,
-2026-05-02,35,Leeds United,Burnley,,
-2026-05-02,35,Aston Villa,Tottenham Hotspur,,
-2026-05-02,35,Bournemouth,Crystal Palace,,
-2026-05-02,35,Brentford,West Ham United,,
-2026-05-02,35,Newcastle,Brighton & Hove Albion,,
-2026-05-02,35,Wolverhampton Wanderers,Sunderland,,
-2026-05-03,35,Arsenal,Fulham,,
-2026-05-03,35,Manchester United,Liverpool,,
-2026-05-04,35,Chelsea,Nottingham Forest,,
-2026-05-05,35,Everton,Manchester City,,
-2026-05-09,36,Liverpool,Chelsea,,
-2026-05-09,36,Brighton & Hove Albion,Wolverhampton Wanderers,,
-2026-05-09,36,Burnley,Aston Villa,,
-2026-05-09,36,Crystal Palace,Everton,,
-2026-05-09,36,Fulham,Bournemouth,,
-2026-05-09,36,Sunderland,Manchester United,,
-2026-05-10,36,Manchester City,Brentford,,
-2026-05-10,36,Nottingham Forest,Newcastle,,
-2026-05-10,36,West Ham United,Arsenal,,
-2026-05-12,36,Tottenham Hotspur,Leeds United,,
-2026-05-17,37,Bournemouth,Manchester City,,
-2026-05-17,37,Arsenal,Burnley,,
-2026-05-17,37,Aston Villa,Liverpool,,
-2026-05-17,37,Brentford,Crystal Palace,,
-2026-05-17,37,Chelsea,Tottenham Hotspur,,
-2026-05-17,37,Everton,Sunderland,,
-2026-05-17,37,Leeds United,Brighton & Hove Albion,,
-2026-05-17,37,Manchester United,Nottingham Forest,,
-2026-05-17,37,Newcastle,West Ham United,,
-2026-05-17,37,Wolverhampton Wanderers,Fulham,,
-2026-05-24,38,Brighton & Hove Albion,Manchester United,,
-2026-05-24,38,Burnley,Wolverhampton Wanderers,,
-2026-05-24,38,Crystal Palace,Arsenal,,
-2026-05-24,38,Fulham,Newcastle,,
-2026-05-24,38,Liverpool,Brentford,,
-2026-05-24,38,Manchester City,Aston Villa,,
-2026-05-24,38,Nottingham Forest,Bournemouth,,
-2026-05-24,38,Sunderland,Chelsea,,
-2026-05-24,38,Tottenham Hotspur,Everton,,
-2026-05-24,38,West Ham United,Leeds United,,
+11/4/2026,32,West Ham United,Wolverhampton Wanderers,4,0
+11/4/2026,32,Arsenal,Bournemouth,1,2
+11/4/2026,32,Brentford,Everton,2,2
+11/4/2026,32,Burnley,Brighton & Hove Albion,0,2
+12/4/2026,32,Liverpool,Fulham,2,0
+12/4/2026,32,Crystal Palace,Newcastle,2,1
+12/4/2026,32,Nottingham Forest,Aston Villa,1,1
+12/4/2026,32,Sunderland,Tottenham Hotspur,1,0
+12/4/2026,32,Chelsea,Manchester City,0,3
+14/4/2026,32,Manchester United,Leeds United,1,2
+18/4/2026,33,Brentford,Fulham,0,0
+18/4/2026,33,Leeds United,Wolverhampton Wanderers,3,0
+18/4/2026,33,Newcastle,Bournemouth,1,2
+19/4/2026,33,Tottenham Hotspur,Brighton & Hove Albion,2,2
+19/4/2026,33,Chelsea,Manchester United,0,1
+19/4/2026,33,Aston Villa,Sunderland,4,3
+19/4/2026,33,Everton,Liverpool,1,2
+19/4/2026,33,Nottingham Forest,Burnley,4,1
+19/4/2026,33,Manchester City,Arsenal,2,1
+21/4/2026,33,Crystal Palace,West Ham United,0,0
+22/4/2026,34,Brighton & Hove Albion,Chelsea,3,0
+23/4/2026,34,Bournemouth,Leeds United,2,2
+23/4/2026,34,Burnley,Manchester City,0,1
+25/4/2026,34,Sunderland,Nottingham Forest,0,5
+25/4/2026,34,Fulham,Aston Villa,1,0
+25/4/2026,34,Liverpool,Crystal Palace,3,1
+25/4/2026,34,West Ham United,Everton,2,1
+25/4/2026,34,Wolverhampton Wanderers,Tottenham Hotspur,0,1
+26/4/2026,34,Arsenal,Newcastle,1,0
+28/4/2026,34,Manchester United,Brentford,2,1
+2/5/2026,35,Leeds United,Burnley,3,1
+2/5/2026,35,Aston Villa,Tottenham Hotspur,,
+2/5/2026,35,Bournemouth,Crystal Palace,,
+2/5/2026,35,Brentford,West Ham United,3,0
+2/5/2026,35,Newcastle,Brighton & Hove Albion,3,1
+2/5/2026,35,Wolverhampton Wanderers,Sunderland,1,1
+3/5/2026,35,Arsenal,Fulham,,
+3/5/2026,35,Manchester United,Liverpool,,
+4/5/2026,35,Chelsea,Nottingham Forest,,
+5/5/2026,35,Everton,Manchester City,,
+9/5/2026,36,Liverpool,Chelsea,,
+9/5/2026,36,Brighton & Hove Albion,Wolverhampton Wanderers,,
+9/5/2026,36,Fulham,Bournemouth,,
+9/5/2026,36,Sunderland,Manchester United,,
+10/5/2026,36,Burnley,Aston Villa,,
+10/5/2026,36,Crystal Palace,Everton,,
+10/5/2026,36,Manchester City,Brentford,,
+10/5/2026,36,Nottingham Forest,Newcastle,,
+10/5/2026,36,West Ham United,Arsenal,,
+12/5/2026,36,Tottenham Hotspur,Leeds United,,
+13/5/2026,36,Manchester City,Crystal Palace,,
+17/5/2026,37,Wolverhampton Wanderers,Fulham,,
+17/5/2026,37,Aston Villa,Liverpool,,
+17/5/2026,37,Brentford,Crystal Palace,,
+17/5/2026,37,Chelsea,Tottenham Hotspur,,
+17/5/2026,37,Everton,Sunderland,,
+17/5/2026,37,Leeds United,Brighton & Hove Albion,,
+17/5/2026,37,Manchester United,Nottingham Forest,,
+18/5/2026,37,Newcastle,West Ham United,,
+19/5/2026,37,Arsenal,Burnley,,
+20/5/2026,37,Bournemouth,Manchester City,,
+24/5/2026,38,Brighton & Hove Albion,Manchester United,,
+24/5/2026,38,Burnley,Wolverhampton Wanderers,,
+24/5/2026,38,Crystal Palace,Arsenal,,
+24/5/2026,38,Fulham,Newcastle,,
+24/5/2026,38,Liverpool,Brentford,,
+24/5/2026,38,Manchester City,Aston Villa,,
+24/5/2026,38,Nottingham Forest,Bournemouth,,
+24/5/2026,38,Sunderland,Chelsea,,
+24/5/2026,38,Tottenham Hotspur,Everton,,
+24/5/2026,38,West Ham United,Leeds United,,
