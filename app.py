@@ -22,6 +22,7 @@ from persistence import (
 from bankroll import build_bankroll, build_current_suggestions, format_money
 from explanations import build_explanation
 from team_aliases import badge_lookup_key
+from data_urls import predictions_cache_url
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -834,12 +835,8 @@ class State(rx.State):
         )
 
     def _load_predictions_cache_dict(self) -> tuple[dict[str, Any] | None, str]:
-        """Read cache JSON from PREDICTIONS_CACHE_URL if set, else predictions_cache.json."""
-        url = (
-            os.getenv("PREDICTIONS_CACHE_URL")
-            or os.getenv("AUGO_PREDICTIONS_CACHE_URL")
-            or ""
-        ).strip()
+        """Read cache JSON from env, remote_data_urls.json, or predictions_cache.json."""
+        url = predictions_cache_url()
         if url:
             try:
                 r = requests.get(url, timeout=20)

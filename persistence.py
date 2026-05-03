@@ -21,6 +21,8 @@ import pandas as pd
 
 from team_aliases import fixture_lookup_key
 
+from data_urls import results_csv_url
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_DIR = os.path.join(APP_DIR, "predictions_history")
 RESULTS_FILE = os.path.join(APP_DIR, "results.csv")
@@ -71,8 +73,8 @@ def _result_letter(home_goals: Any, away_goals: Any) -> str | None:
 
 
 def _results_dataframe() -> pd.DataFrame | None:
-    """Load results from RESULTS_URL / AUGO_RESULTS_URL if set, else results.csv."""
-    url = (os.getenv("RESULTS_URL") or os.getenv("AUGO_RESULTS_URL") or "").strip()
+    """Load results from env, remote_data_urls.json, or results.csv."""
+    url = results_csv_url()
     if url:
         try:
             return pd.read_csv(url)
@@ -89,7 +91,7 @@ def _results_dataframe() -> pd.DataFrame | None:
 def load_results() -> dict[tuple[int, str, str], dict[str, Any]]:
     """Return {(gw, home_short, away_short): {actual, home_goals, away_goals}}.
 
-    Reads results.csv, or a public CSV URL from RESULTS_URL / AUGO_RESULTS_URL
+    Reads results.csv, or a public CSV URL from env / remote_data_urls.json
     when set (for deployed apps). Missing / invalid -> empty dict.
     """
     out: dict[tuple[int, str, str], dict[str, Any]] = {}
