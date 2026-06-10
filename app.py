@@ -30,7 +30,29 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ODDS_DISPLAY_CAP = 200.0
 CACHE_FILE = os.path.join(APP_DIR, "predictions_cache.json")
-CACHE_MAX_AGE_HOURS = 36
+
+
+def _cache_max_age_hours() -> float:
+    """Max cache age before falling back to live inference.
+
+    Default 168 h (7 days) fits a weekly ``run_pipeline`` cadence. Override with
+    ``CACHE_MAX_AGE_HOURS`` or ``AUGO_CACHE_MAX_AGE_HOURS``. Use ``0`` to disable
+    the stale check entirely.
+    """
+    for key in ("CACHE_MAX_AGE_HOURS", "AUGO_CACHE_MAX_AGE_HOURS"):
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            continue
+        try:
+            v = float(raw)
+            if math.isfinite(v) and v >= 0:
+                return v
+        except ValueError:
+            continue
+    return 168.0
+
+
+CACHE_MAX_AGE_HOURS = _cache_max_age_hours()
 
 
 def _local_today_hk() -> pd.Timestamp:
@@ -192,6 +214,65 @@ class EloChartDict(TypedDict):
     elo_positive: bool
 
 # ── State ─────────────────────────────────────────────────────────────────────
+
+def _norm_fixture_date_for_sig(val: Any) -> str:
+    """Normalize dates so cache fixture rows match fixtures.csv (string quirks)."""
+    ts = pd.to_datetime(val, errors="coerce", dayfirst=True)
+    if pd.isna(ts):
+        return str(val).strip() if val is not None else ""
+    return str(ts.normalize().date())
+
+
+def _backfill_poisson_display_fields(prediction: dict[str, Any]) -> None:
+    """Derive Σλ / O2.5 / BTTS / vs-ensemble strings when missing (older caches)."""
+    try:
+        lh = float(prediction.get("lambda_home", 0.0))
+        la = float(prediction.get("lambda_away", 0.0))
+    except (TypeError, ValueError):
+        lh, la = 0.0, 0.0
+    poisson_ready = (lh + la) > 1e-6
+    if prediction.get("disp_poisson_xg_total") in (None, "", "—"):
+        if lh or la:
+            prediction["disp_poisson_xg_total"] = f"{lh + la:.2f}"
+    if prediction.get("disp_poisson_o25") in (None, "", "—"):
+        if not poisson_ready:
+            pass
+        else:
+            try:
+                v = float(prediction.get("poisson_over_25", float("nan")))
+                if math.isfinite(v):
+                    prediction["disp_poisson_o25"] = f"{v * 100:.1f}%"
+            except (TypeError, ValueError):
+                pass
+    if prediction.get("disp_poisson_btts") in (None, "", "—"):
+        if not poisson_ready:
+            pass
+        else:
+            try:
+                v = float(prediction.get("poisson_btts", float("nan")))
+                if math.isfinite(v):
+                    prediction["disp_poisson_btts"] = f"{v * 100:.1f}%"
+            except (TypeError, ValueError):
+                pass
+    if prediction.get("disp_poisson_vs_ensemble") in (None, "", "—"):
+        try:
+            e_h = float(prediction["prob_home"])
+            e_d = float(prediction["prob_draw"])
+            e_a = float(prediction["prob_away"])
+            p_h = float(prediction["poisson_prob_home"])
+            p_d = float(prediction["poisson_prob_draw"])
+            p_a = float(prediction["poisson_prob_away"])
+        except (TypeError, ValueError, KeyError):
+            return
+        if not poisson_ready or (p_h + p_d + p_a) < 0.5:
+            return
+        d_h = (p_h - e_h) * 100.0
+        d_d = (p_d - e_d) * 100.0
+        d_a = (p_a - e_a) * 100.0
+        prediction["disp_poisson_vs_ensemble"] = (
+            f"Poisson−ens. (pp): H {d_h:+.0f} · D {d_d:+.0f} · A {d_a:+.0f}"
+        )
+
 
 class State(rx.State):
     current_tab: str = "home"
@@ -395,7 +476,9 @@ class State(rx.State):
 
     def _load_model_and_elo(self):
         from team_aliases import elo_lookup_key
-        model = joblib.load("xgboost_premier_league_model.pkl")
+        model_path = os.path.join(APP_DIR, "xgboost_premier_league_model.pkl")
+        elo_path = os.path.join(APP_DIR, "premier_league_with_elo_best.csv")
+        model = joblib.load(model_path)
         # Patch LR estimator for sklearn cross-version compatibility
         from sklearn.linear_model import LogisticRegression
         for est in getattr(model, "estimators_", []):
@@ -403,7 +486,7 @@ class State(rx.State):
                 inner = est.named_steps["model"]
                 if isinstance(inner, LogisticRegression) and not hasattr(inner, "multi_class"):
                     setattr(inner, "multi_class", "auto")
-        df_elo = pd.read_csv("premier_league_with_elo_best.csv")
+        df_elo = pd.read_csv(elo_path)
         # Normalise column names: Football-Data CSVs use CamelCase
         rename_map = {}
         if "Date" in df_elo.columns and "date" not in df_elo.columns:
@@ -428,6 +511,21 @@ class State(rx.State):
             lambda t: t  # ELO file already uses short names; no reverse alias needed
         )
         return model, df_elo, elo_lookup_key
+
+    def _with_poisson_layer(self, upcoming: pd.DataFrame, df_elo: pd.DataFrame) -> pd.DataFrame:
+        """Attach λ + Poisson markets using goal_model_*.pkl (same as run_pipeline)."""
+        gh_path = os.path.join(APP_DIR, "goal_model_home.pkl")
+        ga_path = os.path.join(APP_DIR, "goal_model_away.pkl")
+        if not (os.path.isfile(gh_path) and os.path.isfile(ga_path)):
+            return upcoming
+        try:
+            from run_pipeline import add_poisson_outputs
+
+            gh = joblib.load(gh_path)
+            ga = joblib.load(ga_path)
+            return add_poisson_outputs(upcoming, gh, ga, df_elo)
+        except Exception:
+            return upcoming
 
     def _compute_current_elo(
         self,
@@ -827,9 +925,9 @@ class State(rx.State):
         """Stable signature used to ensure cache matches current fixture list."""
         return sorted(
             (
-                str(r.get("date", "")),
-                str(r.get("home_team", "")),
-                str(r.get("away_team", "")),
+                _norm_fixture_date_for_sig(r.get("date")),
+                str(r.get("home_team", "")).strip(),
+                str(r.get("away_team", "")).strip(),
             )
             for r in rows
         )
@@ -868,7 +966,7 @@ class State(rx.State):
 
         now = pd.Timestamp.now(tz=generated_at.tz) if generated_at.tz is not None else pd.Timestamp.now()
         age_hours = (now - generated_at).total_seconds() / 3600.0
-        if age_hours > CACHE_MAX_AGE_HOURS:
+        if CACHE_MAX_AGE_HOURS > 0 and age_hours > CACHE_MAX_AGE_HOURS:
             return False, f"cache stale ({age_hours:.1f}h old)"
 
         cached_gw = str(cache.get("gameweek", "")).strip()
@@ -915,6 +1013,7 @@ class State(rx.State):
         upcoming["date"] = pd.to_datetime(upcoming["date"])
         upcoming = self._compute_current_elo(upcoming, df_elo, _elo_key)
         upcoming = self._predict_upcoming(upcoming, df_elo, model)
+        upcoming = self._with_poisson_layer(upcoming, df_elo)
         self.predictions = upcoming.to_dict("records")
         for i in range(len(self.predictions)):
             self.predictions[i]["match_idx"] = i
@@ -934,8 +1033,15 @@ class State(rx.State):
         prediction.setdefault("disp_poisson_prob_home", "—")
         prediction.setdefault("disp_poisson_prob_draw", "—")
         prediction.setdefault("disp_poisson_prob_away", "—")
+        prediction.setdefault("poisson_over_25", 0.0)
+        prediction.setdefault("poisson_btts", 0.0)
+        prediction.setdefault("disp_poisson_xg_total", "—")
+        prediction.setdefault("disp_poisson_o25", "—")
+        prediction.setdefault("disp_poisson_btts", "—")
+        prediction.setdefault("disp_poisson_vs_ensemble", "—")
         prediction.setdefault("poisson_correct_scores", [])
         prediction.setdefault("disp_poisson_correct_scores", "—")
+        _backfill_poisson_display_fields(prediction)
         prediction["explanation"] = build_explanation(prediction)
         prediction.setdefault("explanation_summary", prediction["explanation"].get("driver_summary", ""))
 
@@ -1039,6 +1145,7 @@ class State(rx.State):
             df["date"] = pd.to_datetime(df["date"])
             df = self._compute_current_elo(df, df_elo, _elo_key)
             df = self._predict_upcoming(df, df_elo, model)
+            df = self._with_poisson_layer(df, df_elo)
             self.custom_result = df.to_dict("records")
         except Exception as e:
             return rx.toast.error(f"Prediction error: {e}")
@@ -1264,12 +1371,25 @@ def poisson_summary(p: dict) -> rx.Component:
             spacing="3",
             width="100%",
         ),
-        rx.text(
-            p["disp_poisson_correct_scores"],
-            color="#777",
-            font_size="0.62em",
+        rx.hstack(
+            rx.text("Σλ", color="#555", font_size="0.58em", font_weight="600"),
+            rx.text(p["disp_poisson_xg_total"], color="#ccc", font_size="0.62em", font_weight="700"),
+            rx.text("·", color="#333", font_size="0.62em", padding_x="4px"),
+            rx.text("O2.5", color="#555", font_size="0.58em", font_weight="600"),
+            rx.text(p["disp_poisson_o25"], color="#9CCC65", font_size="0.62em", font_weight="700"),
+            rx.text("·", color="#333", font_size="0.62em", padding_x="4px"),
+            rx.text("BTTS", color="#555", font_size="0.58em", font_weight="600"),
+            rx.text(p["disp_poisson_btts"], color="#81D4FA", font_size="0.62em", font_weight="700"),
             width="100%",
-            no_of_lines=1,
+            align="center",
+            spacing="1",
+        ),
+        rx.text(
+            p["disp_poisson_vs_ensemble"],
+            color="#777",
+            font_size="0.6em",
+            width="100%",
+            line_height="1.35",
         ),
         spacing="2",
         width="100%",

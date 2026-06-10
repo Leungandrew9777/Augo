@@ -442,6 +442,23 @@ def poisson_markets(lambda_home: float, lambda_away: float, *, max_goals: int = 
     }
 
 
+def _disp_poisson_vs_ensemble_row(r: pd.Series) -> str:
+    """Poisson minus ensemble outcome probabilities, in percentage points."""
+    try:
+        e_h, e_d, e_a = float(r["prob_home"]), float(r["prob_draw"]), float(r["prob_away"])
+        p_h, p_d, p_a = (
+            float(r["poisson_prob_home"]),
+            float(r["poisson_prob_draw"]),
+            float(r["poisson_prob_away"]),
+        )
+    except (TypeError, ValueError, KeyError):
+        return "—"
+    d_h = (p_h - e_h) * 100.0
+    d_d = (p_d - e_d) * 100.0
+    d_a = (p_a - e_a) * 100.0
+    return f"Poisson−ens. (pp): H {d_h:+.0f} · D {d_d:+.0f} · A {d_a:+.0f}"
+
+
 def add_poisson_outputs(upcoming: pd.DataFrame, home_goal_model, away_goal_model, df_elo: pd.DataFrame) -> pd.DataFrame:
     home_features = _goal_model_features(home_goal_model)
     away_features = _goal_model_features(away_goal_model)
@@ -468,9 +485,11 @@ def add_poisson_outputs(upcoming: pd.DataFrame, home_goal_model, away_goal_model
     upcoming["disp_poisson_prob_home"] = upcoming["poisson_prob_home"].map(lambda v: f"{v*100:.1f}%")
     upcoming["disp_poisson_prob_draw"] = upcoming["poisson_prob_draw"].map(lambda v: f"{v*100:.1f}%")
     upcoming["disp_poisson_prob_away"] = upcoming["poisson_prob_away"].map(lambda v: f"{v*100:.1f}%")
-    upcoming["disp_poisson_correct_scores"] = upcoming["poisson_correct_scores"].map(
-        lambda scores: " · ".join(f"{s['score']} {s['disp_p']}" for s in scores[:3])
-    )
+    tot_lambda = upcoming["lambda_home"] + upcoming["lambda_away"]
+    upcoming["disp_poisson_xg_total"] = tot_lambda.map(lambda v: f"{float(v):.2f}")
+    upcoming["disp_poisson_o25"] = upcoming["poisson_over_25"].map(lambda v: f"{float(v) * 100:.1f}%")
+    upcoming["disp_poisson_btts"] = upcoming["poisson_btts"].map(lambda v: f"{float(v) * 100:.1f}%")
+    upcoming["disp_poisson_vs_ensemble"] = upcoming.apply(_disp_poisson_vs_ensemble_row, axis=1)
     return upcoming
 
 
