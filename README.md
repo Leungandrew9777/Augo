@@ -6,6 +6,12 @@ historical results and ELO ratings, served through a Reflex web UI that lets
 you make picks against the model and grades them automatically as real results
 land.
 
+## World Cup module
+
+International match prediction (XGBoost + StatBomb xG) lives in [`world_cup/`](world_cup/).
+See [`world_cup/README.md`](world_cup/README.md) for train/predict commands. The Augo UI
+includes a **World Cup** toggle in the header.
+
 ## The streamlined rundown
 
 ```

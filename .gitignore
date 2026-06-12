@@ -12,3 +12,13 @@ predictions_history/
 !predictions_history/.gitkeep
 user_picks.json
 bankroll.json
+
+# World Cup runtime artifacts
+world_cup/international_matches_clean.csv
+world_cup/international_with_features.csv
+world_cup/world_cup_xgb_model.pkl
+world_cup/predictions_cache.json
+world_cup/.event_stats_cache.json
+world_cup/predictions_history/
+world_cup/user_picks.json
+!world_cup/predictions_history/.gitkeep

@@ -6,3 +6,4 @@ xgboost==3.2.0
 scikit-learn==1.7.2
 requests==2.32.5
 python-dotenv==1.2.1
+statsbombpy>=1.0.0

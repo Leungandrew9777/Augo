@@ -28,29 +28,56 @@ HISTORY_DIR = os.path.join(APP_DIR, "predictions_history")
 RESULTS_FILE = os.path.join(APP_DIR, "results.csv")
 USER_PICKS_FILE = os.path.join(APP_DIR, "user_picks.json")
 BANKROLL_FILE = os.path.join(APP_DIR, "bankroll.json")
+WC_DIR = os.path.join(APP_DIR, "world_cup")
 
 
-def _norm(name: Any) -> str:
+def competition_paths(competition: str = "pl") -> dict[str, str]:
+    if competition == "world_cup":
+        return {
+            "history_dir": os.path.join(WC_DIR, "predictions_history"),
+            "results_file": os.path.join(WC_DIR, "results.csv"),
+            "user_picks_file": os.path.join(WC_DIR, "user_picks.json"),
+        }
+    return {
+        "history_dir": HISTORY_DIR,
+        "results_file": RESULTS_FILE,
+        "user_picks_file": USER_PICKS_FILE,
+    }
+
+
+def _norm(name: Any, *, competition: str = "pl") -> str:
+    if competition == "world_cup":
+        try:
+            from world_cup.team_aliases import fixture_lookup_key as wc_lookup
+
+            return wc_lookup(str(name).strip())
+        except Exception:
+            return str(name).strip()
     return fixture_lookup_key(str(name).strip())
 
 
 def _gw_from_filename(name: str) -> int | None:
-    m = re.search(r"GW(\d+)", name, re.IGNORECASE)
-    return int(m.group(1)) if m else None
+    for pattern in (r"GW(\d+)", r"R(\d+)"):
+        m = re.search(pattern, name, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
 
 
-def load_archived_predictions() -> dict[int, dict[str, Any]]:
-    """Return {gw_number: cache_dict} for every predictions_history/GW*.json."""
+def load_archived_predictions(competition: str = "pl") -> dict[int, dict[str, Any]]:
+    """Return {gw_number: cache_dict} for every predictions_history/GW*.json or R*.json."""
+    paths = competition_paths(competition)
+    history_dir = paths["history_dir"]
     out: dict[int, dict[str, Any]] = {}
-    if not os.path.isdir(HISTORY_DIR):
+    if not os.path.isdir(history_dir):
         return out
-    for fname in os.listdir(HISTORY_DIR):
+    for fname in os.listdir(history_dir):
         if not fname.lower().endswith(".json"):
             continue
         gw = _gw_from_filename(fname)
         if gw is None:
             continue
-        path = os.path.join(HISTORY_DIR, fname)
+        path = os.path.join(history_dir, fname)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 out[gw] = json.load(f)
@@ -72,42 +99,47 @@ def _result_letter(home_goals: Any, away_goals: Any) -> str | None:
     return "D"
 
 
-def _results_dataframe() -> pd.DataFrame | None:
+def _results_dataframe(competition: str = "pl") -> pd.DataFrame | None:
     """Load results from env, remote_data_urls.json, or results.csv."""
-    url = results_csv_url()
-    if url:
-        try:
-            return pd.read_csv(url)
-        except Exception:
-            pass
-    if not os.path.exists(RESULTS_FILE):
+    if competition == "pl":
+        url = results_csv_url()
+        if url:
+            try:
+                return pd.read_csv(url)
+            except Exception:
+                pass
+    results_file = competition_paths(competition)["results_file"]
+    if not os.path.exists(results_file):
         return None
     try:
-        return pd.read_csv(RESULTS_FILE)
+        return pd.read_csv(results_file)
     except Exception:
         return None
 
 
-def load_results() -> dict[tuple[int, str, str], dict[str, Any]]:
+def load_results(competition: str = "pl") -> dict[tuple[int, str, str], dict[str, Any]]:
     """Return {(gw, home_short, away_short): {actual, home_goals, away_goals}}.
 
     Reads results.csv, or a public CSV URL from env / remote_data_urls.json
     when set (for deployed apps). Missing / invalid -> empty dict.
     """
     out: dict[tuple[int, str, str], dict[str, Any]] = {}
-    df = _results_dataframe()
+    df = _results_dataframe(competition)
     if df is None:
         return out
-    needed = {"gameweek", "home_team", "away_team", "home_goals", "away_goals"}
+    needed = {"home_team", "away_team", "home_goals", "away_goals"}
     if not needed.issubset(df.columns):
+        return out
+    gw_col = "gameweek" if "gameweek" in df.columns else ("round" if "round" in df.columns else None)
+    if gw_col is None:
         return out
     for _, row in df.iterrows():
         try:
-            gw = int(row["gameweek"])
+            gw = int(row[gw_col])
         except (TypeError, ValueError):
             continue
-        home = _norm(row["home_team"])
-        away = _norm(row["away_team"])
+        home = _norm(row["home_team"], competition=competition)
+        away = _norm(row["away_team"], competition=competition)
         actual = _result_letter(row.get("home_goals"), row.get("away_goals"))
         if actual is None:
             continue
@@ -119,12 +151,13 @@ def load_results() -> dict[tuple[int, str, str], dict[str, Any]]:
     return out
 
 
-def load_user_picks() -> dict[int, dict[int, str]]:
+def load_user_picks(competition: str = "pl") -> dict[int, dict[int, str]]:
     """Return {gw: {match_idx: 'H'/'D'/'A'}} from user_picks.json (or {})."""
-    if not os.path.exists(USER_PICKS_FILE):
+    picks_file = competition_paths(competition)["user_picks_file"]
+    if not os.path.exists(picks_file):
         return {}
     try:
-        with open(USER_PICKS_FILE, "r", encoding="utf-8") as f:
+        with open(picks_file, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
         return {}
@@ -150,24 +183,30 @@ def load_user_picks() -> dict[int, dict[int, str]]:
     return out
 
 
-def save_user_picks(picks_by_gw: dict[int, dict[int, str]]) -> None:
+def save_user_picks(picks_by_gw: dict[int, dict[int, str]], *, competition: str = "pl") -> None:
     """Persist the picks map to disk (atomic write)."""
+    picks_file = competition_paths(competition)["user_picks_file"]
     serializable: dict[str, dict[str, str]] = {
         str(int(gw)): {str(int(idx)): pick for idx, pick in picks.items() if pick}
         for gw, picks in picks_by_gw.items()
     }
-    tmp = USER_PICKS_FILE + ".tmp"
+    tmp = picks_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(serializable, f, indent=2)
-    os.replace(tmp, USER_PICKS_FILE)
+    os.replace(tmp, picks_file)
 
 
-def upsert_user_picks_for_gw(gw: int, picks_by_match_idx: dict[int, str]) -> None:
+def upsert_user_picks_for_gw(
+    gw: int,
+    picks_by_match_idx: dict[int, str],
+    *,
+    competition: str = "pl",
+) -> None:
     """Convenience: load -> set one GW -> save."""
-    all_picks = load_user_picks()
+    all_picks = load_user_picks(competition)
     cleaned = {idx: pick for idx, pick in picks_by_match_idx.items() if pick in ("H", "D", "A")}
     all_picks[int(gw)] = cleaned
-    save_user_picks(all_picks)
+    save_user_picks(all_picks, competition=competition)
 
 
 def default_bankroll() -> dict[str, Any]:

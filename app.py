@@ -12,6 +12,7 @@ from typing import Any
 import requests
 
 from persistence import (
+    competition_paths,
     load_archived_predictions,
     load_bankroll,
     load_results,
@@ -30,6 +31,26 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ODDS_DISPLAY_CAP = 200.0
 CACHE_FILE = os.path.join(APP_DIR, "predictions_cache.json")
+WC_DIR = os.path.join(APP_DIR, "world_cup")
+
+
+def _cache_file_for_competition(competition_mode: str) -> str:
+    if competition_mode == "world_cup":
+        return os.path.join(WC_DIR, "predictions_cache.json")
+    return CACHE_FILE
+
+
+def _fixtures_file_for_competition(competition_mode: str) -> str:
+    if competition_mode == "world_cup":
+        return os.path.join(WC_DIR, "fixtures.csv")
+    return os.path.join(APP_DIR, "fixtures.csv")
+
+
+def _round_label_from_value(value: Any, *, competition_mode: str) -> str:
+    if str(value).isdigit():
+        prefix = "R" if competition_mode == "world_cup" else "GW"
+        return f"{prefix}{int(value)}"
+    return str(value)
 
 
 def _cache_max_age_hours() -> float:
@@ -276,6 +297,7 @@ def _backfill_poisson_display_fields(prediction: dict[str, Any]) -> None:
 
 class State(rx.State):
     current_tab: str = "home"
+    competition_mode: str = "pl"  # "pl" | "world_cup"
 
     # Matchweek
     fixtures: list[dict[str, Any]] = FALLBACK_FIXTURES
@@ -391,6 +413,24 @@ class State(rx.State):
             return "#FFB74D"
         return "#444"
 
+    @rx.var
+    def competition_subtitle(self) -> str:
+        if self.competition_mode == "world_cup":
+            return "XGBoost + StatBomb xG · World Cup 2026"
+        return "XGBoost + ELO · 2025/26"
+
+    @rx.var
+    def is_world_cup(self) -> bool:
+        return self.competition_mode == "world_cup"
+
+    def set_competition_pl(self):
+        self.competition_mode = "pl"
+        return State.load_predictions()
+
+    def set_competition_wc(self):
+        self.competition_mode = "world_cup"
+        return State.load_predictions()
+
     # ── Fixtures ──────────────────────────────────────────────────────────────
 
     def _reindex(self):
@@ -400,7 +440,7 @@ class State(rx.State):
     def load_fixtures_from_csv(self):
         # Use an absolute path so running from a different CWD
         # (e.g. during export/dev server) still reads the intended file.
-        path = os.path.join(APP_DIR, "fixtures.csv")
+        path = _fixtures_file_for_competition(self.competition_mode)
         if os.path.exists(path):
             try:
                 df = pd.read_csv(path)
@@ -409,8 +449,11 @@ class State(rx.State):
                 df = df.dropna(subset=["date", "home_team", "away_team"])
                 today = _local_today_hk()
 
-                # Accept either "gameweek" or "matchweek" as the GW column name
-                gw_col = next((c for c in ["gameweek", "matchweek"] if c in df.columns and df[c].notna().any()), None)
+                # Accept round / gameweek / matchweek column names
+                gw_col = next(
+                    (c for c in ["round", "gameweek", "matchweek"] if c in df.columns and df[c].notna().any()),
+                    None,
+                )
 
                 if gw_col:
                     # Find the current or next gameweek:
@@ -424,7 +467,9 @@ class State(rx.State):
                     current_gw = future.iloc[0][gw_col]
                     # Pull ALL fixtures for that GW from the full df, not just future ones
                     selected = df[df[gw_col] == current_gw].sort_values("date")
-                    self.gameweek_label = f"GW{int(current_gw)}" if str(current_gw).isdigit() else f"{current_gw}"
+                    self.gameweek_label = _round_label_from_value(
+                        current_gw, competition_mode=self.competition_mode
+                    )
                 else:
                     # No GW column — fall back to a 4-day window around the next fixture
                     future = df[df["date"] >= today].sort_values("date")
@@ -934,19 +979,21 @@ class State(rx.State):
 
     def _load_predictions_cache_dict(self) -> tuple[dict[str, Any] | None, str]:
         """Read cache JSON from env, remote_data_urls.json, or predictions_cache.json."""
-        url = predictions_cache_url()
-        if url:
-            try:
-                r = requests.get(url, timeout=20)
-                r.raise_for_status()
-                return json.loads(r.text), ""
-            except Exception as e:
-                if not os.path.exists(CACHE_FILE):
-                    return None, f"remote cache failed ({e}); no local file"
-        if not os.path.exists(CACHE_FILE):
+        cache_file = _cache_file_for_competition(self.competition_mode)
+        if self.competition_mode == "pl":
+            url = predictions_cache_url()
+            if url:
+                try:
+                    r = requests.get(url, timeout=20)
+                    r.raise_for_status()
+                    return json.loads(r.text), ""
+                except Exception as e:
+                    if not os.path.exists(cache_file):
+                        return None, f"remote cache failed ({e}); no local file"
+        if not os.path.exists(cache_file):
             return None, "cache file missing"
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(cache_file, "r", encoding="utf-8") as f:
                 return json.load(f), ""
         except Exception:
             return None, "cache unreadable"
@@ -995,8 +1042,9 @@ class State(rx.State):
         gw = _gw_int_from_label(self.gameweek_label)
         if gw is None:
             return
-        history_dir = os.path.join(APP_DIR, "predictions_history")
-        archive_path = os.path.join(history_dir, f"GW{gw}.json")
+        history_dir = competition_paths(self.competition_mode)["history_dir"]
+        prefix = "R" if self.competition_mode == "world_cup" else "GW"
+        archive_path = os.path.join(history_dir, f"{prefix}{gw}.json")
         if os.path.exists(archive_path):
             return
         try:
@@ -1007,13 +1055,20 @@ class State(rx.State):
             pass
 
     def _load_predictions_live(self):
-        model, df_elo, _elo_key = self._load_model_and_elo()
         raw = [{k: v for k, v in f.items() if k != "idx"} for f in self.fixtures]
         upcoming = pd.DataFrame(raw)
         upcoming["date"] = pd.to_datetime(upcoming["date"])
-        upcoming = self._compute_current_elo(upcoming, df_elo, _elo_key)
-        upcoming = self._predict_upcoming(upcoming, df_elo, model)
-        upcoming = self._with_poisson_layer(upcoming, df_elo)
+
+        if self.competition_mode == "world_cup":
+            from world_cup.run_pipeline import predict_fixtures
+
+            upcoming = predict_fixtures(upcoming)
+        else:
+            model, df_elo, _elo_key = self._load_model_and_elo()
+            upcoming = self._compute_current_elo(upcoming, df_elo, _elo_key)
+            upcoming = self._predict_upcoming(upcoming, df_elo, model)
+            upcoming = self._with_poisson_layer(upcoming, df_elo)
+
         self.predictions = upcoming.to_dict("records")
         for i in range(len(self.predictions)):
             self.predictions[i]["match_idx"] = i
@@ -1051,7 +1106,7 @@ class State(rx.State):
         picks: list[str] = [""] * n
         gw = _gw_int_from_label(self.gameweek_label)
         if gw is not None:
-            saved = load_user_picks().get(gw, {})
+            saved = load_user_picks(self.competition_mode).get(gw, {})
             for i, p in enumerate(self.predictions):
                 m_idx = int(p.get("match_idx", i))
                 pick = saved.get(m_idx, "")
@@ -1061,8 +1116,8 @@ class State(rx.State):
 
     def _rebuild_bankroll(self):
         settings = load_bankroll()
-        archives = load_archived_predictions()
-        results = load_results()
+        archives = load_archived_predictions(self.competition_mode)
+        results = load_results(self.competition_mode)
         summary = build_bankroll(archives, results, settings)
         settings["current_bankroll"] = summary["current_bankroll"]
         settings["ledger"] = summary["ledger"]
@@ -1136,16 +1191,21 @@ class State(rx.State):
         if self.custom_home == self.custom_away:
             return rx.toast.error("Pick two different teams.")
         try:
-            model, df_elo, _elo_key = self._load_model_and_elo()
             df = pd.DataFrame([{
                 "date": str(_local_today_hk().date()),
                 "home_team": self.custom_home,
                 "away_team": self.custom_away,
             }])
             df["date"] = pd.to_datetime(df["date"])
-            df = self._compute_current_elo(df, df_elo, _elo_key)
-            df = self._predict_upcoming(df, df_elo, model)
-            df = self._with_poisson_layer(df, df_elo)
+            if self.competition_mode == "world_cup":
+                from world_cup.run_pipeline import predict_fixtures
+
+                df = predict_fixtures(df)
+            else:
+                model, df_elo, _elo_key = self._load_model_and_elo()
+                df = self._compute_current_elo(df, df_elo, _elo_key)
+                df = self._predict_upcoming(df, df_elo, model)
+                df = self._with_poisson_layer(df, df_elo)
             self.custom_result = df.to_dict("records")
         except Exception as e:
             return rx.toast.error(f"Prediction error: {e}")
@@ -1178,7 +1238,7 @@ class State(rx.State):
                 picks_by_idx[int(p.get("match_idx", i))] = pick
 
         try:
-            upsert_user_picks_for_gw(gw, picks_by_idx)
+            upsert_user_picks_for_gw(gw, picks_by_idx, competition=self.competition_mode)
         except Exception as e:
             return rx.toast.error(f"Failed to save picks: {e}")
 
@@ -1203,9 +1263,9 @@ class State(rx.State):
 
     def _rebuild_history(self):
         """Rebuild self.history from disk (archives + results.csv + user_picks.json)."""
-        archives = load_archived_predictions()
-        results = load_results()
-        all_user_picks = load_user_picks()
+        archives = load_archived_predictions(self.competition_mode)
+        results = load_results(self.competition_mode)
+        all_user_picks = load_user_picks(self.competition_mode)
 
         entries: list[dict[str, Any]] = []
         for gw in sorted(archives.keys(), reverse=True):
@@ -2520,8 +2580,26 @@ def index() -> rx.Component:
         rx.vstack(
             rx.box(
                 rx.heading("Augo", size="6", color="white", font_weight="700"),
-                rx.text("XGBoost + ELO · 2025/26", color="#333",
+                rx.text(State.competition_subtitle, color="#333",
                         font_size="0.7em", letter_spacing="0.06em"),
+                rx.hstack(
+                    rx.button(
+                        "Premier League",
+                        on_click=State.set_competition_pl,
+                        size="1",
+                        variant=rx.cond(State.is_world_cup, "outline", "solid"),
+                        color_scheme=rx.cond(State.is_world_cup, "gray", "green"),
+                    ),
+                    rx.button(
+                        "World Cup",
+                        on_click=State.set_competition_wc,
+                        size="1",
+                        variant=rx.cond(State.is_world_cup, "solid", "outline"),
+                        color_scheme=rx.cond(State.is_world_cup, "green", "gray"),
+                    ),
+                    spacing="2",
+                    padding_top="8px",
+                ),
                 padding_x="16px",
                 padding_top="18px",
                 padding_bottom="10px",
